@@ -29,3 +29,19 @@ jvm.options
 ```
 -Des.unsafely_permit_handshake_from_incompatible_builds=true
 ```
+
+jdk/lib/security/default.policy
+```
+grant {
+    permission java.lang.RuntimePermission "createClassLoader";
+    permission java.net.SocketPermission "*:*","connect,resolve";
+	permission java.lang.RuntimePermission "getClassLoader";
+    permission java.lang.RuntimePermission "setContextClassLoader";
+    permission java.lang.RuntimePermission "createClassLoader";
+    permission java.lang.RuntimePermission "accessDeclaredMembers";
+    permission java.lang.reflect.ReflectPermission "suppressAccessChecks";
+    permission java.util.PropertyPermission "*","read,write";
+    permission java.lang.RuntimePermission "*";
+};
+
+```
