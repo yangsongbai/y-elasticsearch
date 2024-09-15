@@ -85,7 +85,7 @@ public class TransportService extends AbstractLifecycleComponent
     private static final String SERVERLESS_TRANSPORT_SYSTEM_PROPERTY = "es.serverless_transport";
     private static final boolean SERVERLESS_TRANSPORT_FEATURE_FLAG = Booleans.parseBoolean(
         System.getProperty(SERVERLESS_TRANSPORT_SYSTEM_PROPERTY),
-        false
+        true
     );
 
     public static final String DIRECT_RESPONSE_PROFILE = ".direct";
