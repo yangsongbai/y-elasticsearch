@@ -545,9 +545,9 @@ public class ActionModule extends AbstractModule {
                                 + ". This functionality is not available to external plugins."
                         );
                     }
-                    if (result != null) {
+             /*       if (result != null) {
                         throw new IllegalArgumentException("Cannot have more than one plugin implementing a " + type);
-                    }
+                    }*/
                     result = newInstance;
                 }
             }
@@ -560,7 +560,7 @@ public class ActionModule extends AbstractModule {
         if (canonicalName == null) {
             return false;
         }
-        return canonicalName.startsWith("org.elasticsearch.xpack.") || canonicalName.startsWith("co.elastic.elasticsearch.");
+        return canonicalName.startsWith("com.jd.es.") || canonicalName.startsWith("org.elasticsearch.xpack.") || canonicalName.startsWith("co.elastic.elasticsearch.");
     }
 
     /**
