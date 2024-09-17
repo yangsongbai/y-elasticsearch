@@ -107,4 +107,72 @@ input_arguments": [
         ]
 ```
 
+```
+#!/bin/bash
+source /etc/profile
+
+ES_NS="elastic_cluster"
+NODE_NAME="elastic_cluster"
+CLUSTER_NAME="elastic_cluster"
+ES_JVM_HEAP=4
+ES_VERSION="es8.13.4"
+Data_dir="/export/Data/elasticsearch"
+Jvm_tmpdir="/export/Data/elasticsearch/${ES_NS}/tmpdir"
+Plugins_dir="/export/Config/elasticsearch/${ES_NS}/EsPlugins"
+if [ ! -d $Data_dir ]; then
+  mkdir -p $Data_dir
+fi
+if [ ! -d ${Jvm_tmpdir} ]; then
+  mkdir -p ${Jvm_tmpdir}
+fi
+
+echo "autoStartTrue" >/tmp/elasticsearchelastic_cluster_AutoStats
+
+PATH_CONF="/export/Config/elasticsearch/${ES_NS}"
+ES_PATH="/home/admin/elasticsearch-8.13.4"
+JVM_HEAP_SIZE="${ES_JVM_HEAP}g"
+OPTS=" -p /tmp/elasticsearchelastic_cluster.pid -d "
+
+if [ ! -f /tmp/elasticsearchelastic_cluster.pid ]; then
+  echo "进程文件不存在,检查并创建"
+  processID=$(ps -ef | grep "$ES_PATH" | grep "$NODE_NAME" | grep -v grep | awk '{print $2}')
+  echo ${processID} >/tmp/elasticsearchelastic_cluster.pid
+fi
+
+PID=$(cat /tmp/elasticsearchelastic_cluster.pid)
+if [ -f "/proc/${PID}/status" ]; then
+  echo "prcoess $PID is runing"
+  exit 0
+else
+  echo "准备启动ES实例"
+fi
+
+if [ ! -n "$CLUSTER_NAME" ]; then
+  echo "cluster_name is null ! ERROR"
+fi
+if [ ! -n "$NODE_NAME" ]; then
+  echo "cluster node_name is null! ERROR"
+fi
+if [ ! -L "${ES_PATH}/plugins" ]; then
+  /bin/rm -rf ${ES_PATH}/plugins
+  ln -s ${Plugins_dir} ${ES_PATH}/plugins
+fi
+if [ -n "$JVM_HEAP_SIZE" ]; then
+  ES_JAVA_OPTS="-Xms$JVM_HEAP_SIZE -Xmx$JVM_HEAP_SIZE"
+fi
+
+export ES_JAVA_OPTS="$ES_JAVA_OPTS --add-exports org.elasticsearch.server/org.elasticsearch.plugins.interceptor=ALL-UNNAMED"
+
+if [[ -e "${PATH_CONF}/elasticsearch.keystore.tmp" ]]; then
+  rm -f ${PATH_CONF}/elasticsearch.keystore.tmp
+fi
+if [[ -e "${PATH_CONF}/elasticsearch.keystore" ]]; then
+  rm -f ${PATH_CONF}/elasticsearch.keystore
+fi
+
+
+echo "Starting Elasticsearch with the options $OPTS"
+ES_PATH_CONF=$PATH_CONF ${ES_PATH}/bin/elasticsearch $OPTS > start.log 2>&1 &
+```
+
 
