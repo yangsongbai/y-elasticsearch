@@ -310,7 +310,9 @@ module org.elasticsearch.server {
     exports org.elasticsearch.persistent;
     exports org.elasticsearch.persistent.decider;
     exports org.elasticsearch.plugins;
-    exports org.elasticsearch.plugins.interceptor to org.elasticsearch.security, org.elasticsearch.serverless.rest;
+    exports org.elasticsearch.plugins.interceptor;
+    exports org.elasticsearch.plugins.internal;
+    //exports org.elasticsearch.plugins.interceptor to org.elasticsearch.security, org.elasticsearch.serverless.rest;
     exports org.elasticsearch.plugins.spi;
     exports org.elasticsearch.repositories;
     exports org.elasticsearch.repositories.blobstore;
@@ -392,14 +394,14 @@ module org.elasticsearch.server {
     exports org.elasticsearch.action.datastreams.lifecycle;
     exports org.elasticsearch.action.datastreams.autosharding;
     exports org.elasticsearch.action.downsample;
-    exports org.elasticsearch.plugins.internal
+/*    exports org.elasticsearch.plugins.internal
         to
             org.elasticsearch.metering,
             org.elasticsearch.stateless,
             org.elasticsearch.settings.secure,
             org.elasticsearch.serverless.constants,
             org.elasticsearch.serverless.apifiltering,
-            org.elasticsearch.internal.security;
+            org.elasticsearch.internal.security;*/
 
     exports org.elasticsearch.telemetry.tracing;
     exports org.elasticsearch.telemetry;
