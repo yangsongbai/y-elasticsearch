@@ -23,12 +23,14 @@ import org.elasticsearch.common.filesystem.FileSystemNatives;
 import org.elasticsearch.common.io.stream.InputStreamStreamInput;
 import org.elasticsearch.common.logging.LogConfigurator;
 import org.elasticsearch.common.network.IfConfig;
+import org.elasticsearch.common.settings.KeyStoreWrapper;
 import org.elasticsearch.common.settings.SecureSettings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.BoundTransportAddress;
 import org.elasticsearch.common.util.concurrent.RunOnce;
 import org.elasticsearch.core.AbstractRefCounted;
 import org.elasticsearch.core.IOUtils;
+import org.elasticsearch.core.PathUtils;
 import org.elasticsearch.core.SuppressForbidden;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.index.IndexVersion;
@@ -42,12 +44,14 @@ import org.elasticsearch.node.Node;
 import org.elasticsearch.node.NodeValidationException;
 import org.elasticsearch.preallocate.Preallocate;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.lang.invoke.MethodHandles;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.Permission;
 import java.security.Security;
 import java.util.List;
@@ -124,6 +128,16 @@ class Elasticsearch {
             // note that reading server args does *not* close System.in, as it will be read from later for shutdown notification
             var in = new InputStreamStreamInput(System.in);
             args = new ServerArgs(in);
+/*            String esHome = "/Users/yangsongbai/apps/elk/es_home/elasticsearch-8.15.1";
+            Settings build = Settings.builder().put(Environment.PATH_HOME_SETTING.getKey(), PathUtils.get(esHome)).build();
+            args =  new ServerArgs(
+            true,
+            true,
+            null,
+                KeyStoreWrapper.create(),
+                build,
+                PathUtils.get("/Users/yangsongbai/apps/elk/es_home/elasticsearch-8.15.1/config"),
+            null);*/
 
             // mostly just paths are used in phase 1, so secure settings are not needed
             Environment nodeEnv = new Environment(args.nodeSettings(), args.configDir());

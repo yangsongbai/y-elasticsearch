@@ -48,7 +48,7 @@ public class ReleaseVersions {
             String versionsFileName = versionContainer.getSimpleName() + ".csv";
             InputStream versionsFile = versionContainer.getResourceAsStream(versionsFileName);
             if (versionsFile == null) {
-                throw new FileNotFoundException(Strings.format("Could not find versions file for class [%s]", versionContainer));
+                throw new FileNotFoundException(Strings.format("Could not find versions file:[%s] for class [%s]", versionsFileName, versionContainer));
             }
 
             NavigableMap<Integer, List<Version>> versions = new TreeMap<>();
