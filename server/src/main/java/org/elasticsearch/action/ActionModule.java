@@ -536,7 +536,7 @@ public class ActionModule extends AbstractModule {
                 var newInstance = function.apply(restPlugin);
                 if (newInstance != null) {
                     logger.debug("Using custom {} from plugin {}", type, plugin.getClass().getName());
-                    if (isInternalPlugin(plugin) == false) {
+/*                    if (isInternalPlugin(plugin) == false) {
                         throw new IllegalArgumentException(
                             "The "
                                 + plugin.getClass().getName()
@@ -544,10 +544,10 @@ public class ActionModule extends AbstractModule {
                                 + type
                                 + ". This functionality is not available to external plugins."
                         );
-                    }
-             /*       if (result != null) {
-                        throw new IllegalArgumentException("Cannot have more than one plugin implementing a " + type);
                     }*/
+                    if (result != null) {
+                        throw new IllegalArgumentException("Cannot have more than one plugin implementing a " + type);
+                    }
                     result = newInstance;
                 }
             }
@@ -555,13 +555,13 @@ public class ActionModule extends AbstractModule {
         return result;
     }
 
-    private static boolean isInternalPlugin(ActionPlugin plugin) {
+/*    private static boolean isInternalPlugin(ActionPlugin plugin) {
         final String canonicalName = plugin.getClass().getCanonicalName();
         if (canonicalName == null) {
             return false;
         }
         return canonicalName.startsWith("com.jd.es.") || canonicalName.startsWith("org.elasticsearch.xpack.") || canonicalName.startsWith("co.elastic.elasticsearch.");
-    }
+    }*/
 
     /**
      * Certain request header values need to be copied in the thread context under which request handlers are to be dispatched.
