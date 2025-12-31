@@ -10,7 +10,6 @@
 package org.elasticsearch.index.fielddata;
 
 import org.apache.lucene.index.LeafReaderContext;
-import org.apache.lucene.index.SortedNumericDocValues;
 import org.elasticsearch.index.mapper.ValueFetcher;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.script.field.DocValuesScriptFieldFactory;
@@ -25,16 +24,16 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 
-public class SourceValueFetcherSortedNumericIndexFieldData extends SourceValueFetcherIndexFieldData<SortedNumericDocValues> {
+public class SourceValueFetcherSortedNumericIndexFieldData extends SourceValueFetcherIndexFieldData<SortedNumericLongValues> {
 
-    public static class Builder extends SourceValueFetcherIndexFieldData.Builder<SortedNumericDocValues> {
+    public static class Builder extends SourceValueFetcherIndexFieldData.Builder<SortedNumericLongValues> {
 
         public Builder(
             String fieldName,
             ValuesSourceType valuesSourceType,
             ValueFetcher valueFetcher,
             SourceProvider sourceProvider,
-            ToScriptFieldFactory<SortedNumericDocValues> toScriptFieldFactory
+            ToScriptFieldFactory<SortedNumericLongValues> toScriptFieldFactory
         ) {
             super(fieldName, valuesSourceType, valueFetcher, sourceProvider, toScriptFieldFactory);
         }
@@ -56,20 +55,20 @@ public class SourceValueFetcherSortedNumericIndexFieldData extends SourceValueFe
         ValuesSourceType valuesSourceType,
         ValueFetcher valueFetcher,
         SourceProvider sourceProvider,
-        ToScriptFieldFactory<SortedNumericDocValues> toScriptFieldFactory
+        ToScriptFieldFactory<SortedNumericLongValues> toScriptFieldFactory
     ) {
         super(fieldName, valuesSourceType, valueFetcher, sourceProvider, toScriptFieldFactory);
     }
 
     @Override
-    public SourceValueFetcherSortedNumericLeafFieldData loadDirect(LeafReaderContext context) throws Exception {
+    public SourceValueFetcherSortedNumericLeafFieldData loadDirect(LeafReaderContext context) {
         return new SourceValueFetcherSortedNumericLeafFieldData(toScriptFieldFactory, context, valueFetcher, sourceProvider);
     }
 
-    public static class SourceValueFetcherSortedNumericLeafFieldData extends SourceValueFetcherLeafFieldData<SortedNumericDocValues> {
+    public static class SourceValueFetcherSortedNumericLeafFieldData extends SourceValueFetcherLeafFieldData<SortedNumericLongValues> {
 
         public SourceValueFetcherSortedNumericLeafFieldData(
-            ToScriptFieldFactory<SortedNumericDocValues> toScriptFieldFactory,
+            ToScriptFieldFactory<SortedNumericLongValues> toScriptFieldFactory,
             LeafReaderContext leafReaderContext,
             ValueFetcher valueFetcher,
             SourceProvider sourceProvider
@@ -86,7 +85,7 @@ public class SourceValueFetcherSortedNumericIndexFieldData extends SourceValueFe
         }
     }
 
-    public static class SourceValueFetcherSortedNumericDocValues extends SortedNumericDocValues implements ValueFetcherDocValues {
+    public static class SourceValueFetcherSortedNumericDocValues extends SortedNumericLongValues implements ValueFetcherDocValues {
 
         protected final LeafReaderContext leafReaderContext;
 
@@ -129,29 +128,9 @@ public class SourceValueFetcherSortedNumericIndexFieldData extends SourceValueFe
         }
 
         @Override
-        public long nextValue() throws IOException {
+        public long nextValue() {
             assert iterator.hasNext();
             return iterator.next();
-        }
-
-        @Override
-        public int docID() {
-            throw new UnsupportedOperationException("not supported for source fallback");
-        }
-
-        @Override
-        public int nextDoc() throws IOException {
-            throw new UnsupportedOperationException("not supported for source fallback");
-        }
-
-        @Override
-        public int advance(int target) throws IOException {
-            throw new UnsupportedOperationException("not supported for source fallback");
-        }
-
-        @Override
-        public long cost() {
-            throw new UnsupportedOperationException("not supported for source fallback");
         }
     }
 }

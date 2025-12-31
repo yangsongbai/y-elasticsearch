@@ -10,7 +10,6 @@ package org.elasticsearch.cluster.coordination;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.elasticsearch.TransportVersions;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.coordination.CoordinationMetadata.VotingConfiguration;
 import org.elasticsearch.cluster.coordination.CoordinationState.VoteCollection;
@@ -68,6 +67,7 @@ public class ClusterFormationFailureHelper {
     private final Runnable logLastFailedJoinAttempt;
     @Nullable // if no warning is scheduled
     private volatile WarningScheduler warningScheduler;
+    private volatile boolean loggingEnabled;
 
     /**
      * Works with the {@link JoinHelper} to log the latest node-join attempt failure and cluster state debug information. Must call
@@ -90,6 +90,11 @@ public class ClusterFormationFailureHelper {
         this.clusterCoordinationExecutor = threadPool.executor(Names.CLUSTER_COORDINATION);
         this.clusterFormationWarningTimeout = DISCOVERY_CLUSTER_FORMATION_WARNING_TIMEOUT_SETTING.get(settings);
         this.logLastFailedJoinAttempt = logLastFailedJoinAttempt;
+        this.loggingEnabled = true;
+    }
+
+    public void setLoggingEnabled(boolean enabled) {
+        this.loggingEnabled = enabled;
     }
 
     public boolean isRunning() {
@@ -98,7 +103,7 @@ public class ClusterFormationFailureHelper {
 
     /**
      * Schedules a warning debug message to be logged in 'clusterFormationWarningTimeout' time, and periodically thereafter, until
-     * {@link ClusterFormationState#stop()} has been called.
+     * {@link ClusterFormationFailureHelper#stop()} has been called.
      */
     public void start() {
         assert warningScheduler == null;
@@ -125,7 +130,7 @@ public class ClusterFormationFailureHelper {
 
                 @Override
                 protected void doRun() {
-                    if (isActive()) {
+                    if (isActive() && loggingEnabled) {
                         logLastFailedJoinAttempt.run();
                         logger.warn(
                             "{}; for troubleshooting guidance, see {}",
@@ -242,9 +247,7 @@ public class ClusterFormationFailureHelper {
                 new VotingConfiguration(in),
                 in.readCollectionAsImmutableList(TransportAddress::new),
                 in.readCollectionAsImmutableList(DiscoveryNode::new),
-                in.getTransportVersion().onOrAfter(TransportVersions.V_8_13_0)
-                    ? in.readCollectionAsImmutableSet(DiscoveryNode::new)
-                    : Set.of(),
+                in.readCollectionAsImmutableSet(DiscoveryNode::new),
                 in.readLong(),
                 in.readBoolean(),
                 new StatusInfo(in),
@@ -424,9 +427,7 @@ public class ClusterFormationFailureHelper {
             lastCommittedConfiguration.writeTo(out);
             out.writeCollection(resolvedAddresses);
             out.writeCollection(foundPeers);
-            if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_13_0)) {
-                out.writeCollection(mastersOfPeers);
-            }
+            out.writeCollection(mastersOfPeers);
             out.writeLong(currentTerm);
             out.writeBoolean(hasDiscoveredQuorum);
             statusInfo.writeTo(out);

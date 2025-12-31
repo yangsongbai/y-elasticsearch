@@ -14,7 +14,6 @@ import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.DocWriteRequest;
 import org.elasticsearch.action.DocWriteResponse;
 import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
-import org.elasticsearch.action.bulk.BackoffPolicy;
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkItemResponse.Failure;
 import org.elasticsearch.action.bulk.BulkRequest;
@@ -26,6 +25,7 @@ import org.elasticsearch.action.search.SearchRequest;
 import org.elasticsearch.action.support.TransportAction;
 import org.elasticsearch.action.support.broadcast.BroadcastResponse;
 import org.elasticsearch.client.internal.ParentTaskAssigningClient;
+import org.elasticsearch.common.BackoffPolicy;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
@@ -43,8 +43,8 @@ import org.elasticsearch.script.CtxMap;
 import org.elasticsearch.script.Metadata;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptService;
-import org.elasticsearch.search.Scroll;
 import org.elasticsearch.search.builder.SearchSourceBuilder;
+import org.elasticsearch.search.fetch.subphase.FetchSourceContext;
 import org.elasticsearch.search.sort.SortBuilder;
 import org.elasticsearch.threadpool.ThreadPool;
 
@@ -64,7 +64,7 @@ import static java.lang.Math.max;
 import static java.lang.Math.min;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.unmodifiableList;
-import static org.elasticsearch.action.bulk.BackoffPolicy.exponentialBackoff;
+import static org.elasticsearch.common.BackoffPolicy.exponentialBackoff;
 import static org.elasticsearch.core.TimeValue.timeValueNanos;
 import static org.elasticsearch.index.reindex.AbstractBulkByScrollRequest.MAX_DOCS_ALL_MATCHES;
 import static org.elasticsearch.rest.RestStatus.CONFLICT;
@@ -120,6 +120,7 @@ public abstract class AbstractAsyncBulkByScrollAction<
         BulkByScrollTask task,
         boolean needsSourceDocumentVersions,
         boolean needsSourceDocumentSeqNoAndPrimaryTerm,
+        boolean needsVectors,
         Logger logger,
         ParentTaskAssigningClient client,
         ThreadPool threadPool,
@@ -132,6 +133,7 @@ public abstract class AbstractAsyncBulkByScrollAction<
             task,
             needsSourceDocumentVersions,
             needsSourceDocumentSeqNoAndPrimaryTerm,
+            needsVectors,
             logger,
             client,
             client,
@@ -147,6 +149,7 @@ public abstract class AbstractAsyncBulkByScrollAction<
         BulkByScrollTask task,
         boolean needsSourceDocumentVersions,
         boolean needsSourceDocumentSeqNoAndPrimaryTerm,
+        boolean needsVectors,
         Logger logger,
         ParentTaskAssigningClient searchClient,
         ParentTaskAssigningClient bulkClient,
@@ -174,7 +177,7 @@ public abstract class AbstractAsyncBulkByScrollAction<
         bulkRetry = new Retry(BackoffPolicy.wrap(backoffPolicy, worker::countBulkRetry), threadPool);
         scrollSource = buildScrollableResultSource(
             backoffPolicy,
-            prepareSearchRequest(mainRequest, needsSourceDocumentVersions, needsSourceDocumentSeqNoAndPrimaryTerm)
+            prepareSearchRequest(mainRequest, needsSourceDocumentVersions, needsSourceDocumentSeqNoAndPrimaryTerm, needsVectors)
         );
         scriptApplier = Objects.requireNonNull(buildScriptApplier(), "script applier must not be null");
     }
@@ -187,7 +190,8 @@ public abstract class AbstractAsyncBulkByScrollAction<
     static <Request extends AbstractBulkByScrollRequest<Request>> SearchRequest prepareSearchRequest(
         Request mainRequest,
         boolean needsSourceDocumentVersions,
-        boolean needsSourceDocumentSeqNoAndPrimaryTerm
+        boolean needsSourceDocumentSeqNoAndPrimaryTerm,
+        boolean needsVectors
     ) {
         var preparedSearchRequest = new SearchRequest(mainRequest.getSearchRequest());
 
@@ -206,13 +210,23 @@ public abstract class AbstractAsyncBulkByScrollAction<
         sourceBuilder.version(needsSourceDocumentVersions);
         sourceBuilder.seqNoAndPrimaryTerm(needsSourceDocumentSeqNoAndPrimaryTerm);
 
+        if (needsVectors) {
+            // always include vectors in the response unless explicitly set
+            var fetchSource = sourceBuilder.fetchSource();
+            if (fetchSource == null) {
+                sourceBuilder.fetchSource(FetchSourceContext.FETCH_ALL_SOURCE_EXCLUDE_INFERENCE_FIELDS);
+            } else if (fetchSource.excludeVectors() == null) {
+                sourceBuilder.excludeVectors(false);
+            }
+        }
+
         /*
          * Do not open scroll if max docs <= scroll size and not resuming on version conflicts
          */
         if (mainRequest.getMaxDocs() != MAX_DOCS_ALL_MATCHES
             && mainRequest.getMaxDocs() <= preparedSearchRequest.source().size()
             && mainRequest.isAbortOnVersionConflict()) {
-            preparedSearchRequest.scroll((Scroll) null);
+            preparedSearchRequest.scroll(null);
         }
 
         return preparedSearchRequest;

@@ -10,7 +10,6 @@
 package org.elasticsearch.index.fielddata;
 
 import org.apache.lucene.util.Accountable;
-import org.elasticsearch.core.Releasable;
 import org.elasticsearch.script.field.DocValuesScriptFieldFactory;
 import org.elasticsearch.search.DocValueFormat;
 
@@ -19,7 +18,7 @@ import java.io.IOException;
 /**
  * The thread safe {@link org.apache.lucene.index.LeafReader} level cache of the data.
  */
-public interface LeafFieldData extends Accountable, Releasable {
+public interface LeafFieldData extends Accountable {
 
     /**
      * Returns an {@link DocValuesScriptFieldFactory} to access either

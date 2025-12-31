@@ -47,10 +47,12 @@ public class TimeSeriesRoutingHashFieldMapper extends MetadataFieldMapper {
 
     public static final TypeParser PARSER = new FixedTypeParser(c -> c.getIndexSettings().getMode().timeSeriesRoutingHashFieldMapper());
 
+    public static final DocValueFormat TS_ROUTING_HASH_DOC_VALUE_FORMAT = TimeSeriesRoutingHashFieldType.DOC_VALUE_FORMAT;
+
     static final class TimeSeriesRoutingHashFieldType extends MappedFieldType {
 
         private static final TimeSeriesRoutingHashFieldType INSTANCE = new TimeSeriesRoutingHashFieldType();
-        private static final DocValueFormat DOC_VALUE_FORMAT = new DocValueFormat() {
+        static final DocValueFormat DOC_VALUE_FORMAT = new DocValueFormat() {
 
             @Override
             public String getWriteableName() {
@@ -65,10 +67,17 @@ public class TimeSeriesRoutingHashFieldMapper extends MetadataFieldMapper {
                 return Uid.decodeId(value.bytes, value.offset, value.length);
             }
 
+            @Override
+            public BytesRef parseBytesRef(Object value) {
+                if (value instanceof BytesRef valueAsBytesRef) {
+                    return valueAsBytesRef;
+                }
+                return Uid.encodeId(value.toString());
+            }
         };
 
         private TimeSeriesRoutingHashFieldType() {
-            super(NAME, false, false, true, TextSearchInfo.NONE, Collections.emptyMap());
+            super(NAME, IndexType.docValuesOnly(), false, Collections.emptyMap());
         }
 
         @Override

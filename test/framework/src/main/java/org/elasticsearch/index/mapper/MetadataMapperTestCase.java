@@ -11,7 +11,6 @@ package org.elasticsearch.index.mapper;
 
 import org.elasticsearch.common.compress.CompressedXContent;
 import org.elasticsearch.core.CheckedConsumer;
-import org.elasticsearch.core.UpdateForV9;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.IndexVersions;
 import org.elasticsearch.index.mapper.MapperService.MergeReason;
@@ -40,7 +39,7 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
 
     protected abstract void registerParameters(ParameterChecker checker) throws IOException;
 
-    private record ConflictCheck(XContentBuilder init, XContentBuilder update) {}
+    private record ConflictCheck(XContentBuilder init, XContentBuilder update, Consumer<DocumentMapper> check) {}
 
     private record UpdateCheck(XContentBuilder init, XContentBuilder update, Consumer<DocumentMapper> check) {}
 
@@ -60,7 +59,7 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
                 b.startObject(fieldName());
                 update.accept(b);
                 b.endObject();
-            })));
+            }), d -> {}));
         }
 
         /**
@@ -70,8 +69,8 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
          * @param init   the initial mapping
          * @param update the updated mapping
          */
-        public void registerConflictCheck(String param, XContentBuilder init, XContentBuilder update) {
-            conflictChecks.put(param, new ConflictCheck(init, update));
+        public void registerConflictCheck(String param, XContentBuilder init, XContentBuilder update, Consumer<DocumentMapper> check) {
+            conflictChecks.put(param, new ConflictCheck(init, update, check));
         }
 
         public void registerUpdateCheck(XContentBuilder init, XContentBuilder update, Consumer<DocumentMapper> check) {
@@ -97,6 +96,7 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
                 e.getMessage(),
                 anyOf(containsString("Cannot update parameter [" + param + "]"), containsString("different [" + param + "]"))
             );
+            checker.conflictChecks.get(param).check.accept(mapperService.documentMapper());
         }
         for (UpdateCheck updateCheck : checker.updateChecks) {
             MapperService mapperService = createMapperService(updateCheck.init);
@@ -144,13 +144,15 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
         assertEquals("Failed to parse mapping: " + fieldName() + " is not configurable", exception.getMessage());
     }
 
-    @UpdateForV9
-    // This was previously testing for index versions between 7.0.0 and 8.6.0 but has been bumped to 8.0.0 - 8.6.0
-    // Verify this is the correct action.
     public void testTypeAndFriendsAreAcceptedBefore_8_6_0() throws IOException {
         assumeTrue("Metadata field " + fieldName() + " isn't configurable", isConfigurable());
         IndexVersion previousVersion = IndexVersionUtils.getPreviousVersion(IndexVersions.V_8_6_0);
-        IndexVersion version = IndexVersionUtils.randomVersionBetween(random(), IndexVersions.MINIMUM_COMPATIBLE, previousVersion);
+        // we randomly also pick read-only versions to test that we can still parse the parameters for them
+        IndexVersion version = IndexVersionUtils.randomVersionBetween(
+            random(),
+            IndexVersionUtils.getLowestReadCompatibleVersion(),
+            previousVersion
+        );
         assumeTrue("Metadata field " + fieldName() + " is not supported on version " + version, isSupportedOn(version));
         MapperService mapperService = createMapperService(version, mapping(b -> {}));
         // these parameters were previously silently ignored, they will still be ignored in existing indices
@@ -171,9 +173,38 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
         }
     }
 
-    public void testTypeAndFriendsAreDeprecatedFrom_8_6_0() throws IOException {
+    public void testTypeAndFriendsAreDeprecatedFrom_8_6_0_TO_9_0_0() throws IOException {
         assumeTrue("Metadata field " + fieldName() + " isn't configurable", isConfigurable());
-        IndexVersion version = IndexVersionUtils.randomVersionBetween(random(), IndexVersions.V_8_6_0, IndexVersion.current());
+        IndexVersion previousVersion = IndexVersionUtils.getPreviousVersion(IndexVersions.UPGRADE_TO_LUCENE_10_0_0);
+        IndexVersion version = IndexVersionUtils.randomVersionBetween(random(), IndexVersions.V_8_6_0, previousVersion);
+        assumeTrue("Metadata field " + fieldName() + " is not supported on version " + version, isSupportedOn(version));
+        MapperService mapperService = createMapperService(version, mapping(b -> {}));
+        // these parameters were deprecated, they now should throw an error in new indices
+        String[] unsupportedParameters = new String[] { "fields", "copy_to", "boost", "type" };
+        for (String param : unsupportedParameters) {
+            String mappingAsString = "{\n"
+                + "    \"_doc\" : {\n"
+                + "      \""
+                + fieldName()
+                + "\" : {\n"
+                + "        \""
+                + param
+                + "\" : \"any\"\n"
+                + "      }\n"
+                + "    }\n"
+                + "}";
+            assertNotNull(mapperService.parseMapping("_doc", MergeReason.MAPPING_UPDATE, new CompressedXContent(mappingAsString)));
+            assertWarnings("Parameter [" + param + "] has no effect on metadata field [" + fieldName() + "] and will be removed in future");
+        }
+    }
+
+    public void testTypeAndFriendsThrow_After_9_0_0() throws IOException {
+        assumeTrue("Metadata field " + fieldName() + " isn't configurable", isConfigurable());
+        IndexVersion version = IndexVersionUtils.randomVersionBetween(
+            random(),
+            IndexVersions.UPGRADE_TO_LUCENE_10_0_0,
+            IndexVersion.current()
+        );
         assumeTrue("Metadata field " + fieldName() + " is not supported on version " + version, isSupportedOn(version));
         MapperService mapperService = createMapperService(version, mapping(b -> {}));
         // these parameters were previously silently ignored, they are now deprecated in new indices
@@ -190,8 +221,10 @@ public abstract class MetadataMapperTestCase extends MapperServiceTestCase {
                 + "      }\n"
                 + "    }\n"
                 + "}";
-            assertNotNull(mapperService.parseMapping("_doc", MergeReason.MAPPING_UPDATE, new CompressedXContent(mappingAsString)));
-            assertWarnings("Parameter [" + param + "] has no effect on metadata field [" + fieldName() + "] and will be removed in future");
+            expectThrows(
+                MapperParsingException.class,
+                () -> mapperService.parseMapping("_doc", MergeReason.MAPPING_UPDATE, new CompressedXContent(mappingAsString))
+            );
         }
     }
 }

@@ -27,6 +27,7 @@ import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.CheckedConsumer;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.Releasables;
 import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
@@ -41,14 +42,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.elasticsearch.core.Strings.format;
 
 public abstract class TransportNodesAction<
-    NodesRequest extends BaseNodesRequest<NodesRequest>,
+    NodesRequest extends BaseNodesRequest,
     NodesResponse extends BaseNodesResponse<?>,
     NodeRequest extends TransportRequest,
-    NodeResponse extends BaseNodeResponse> extends TransportAction<NodesRequest, NodesResponse> {
+    NodeResponse extends BaseNodeResponse,
+    ActionContext> extends TransportAction<NodesRequest, NodesResponse> {
 
     private static final Logger logger = LogManager.getLogger(TransportNodesAction.class);
 
@@ -94,8 +97,10 @@ public abstract class TransportNodesAction<
 
         new CancellableFanOut<DiscoveryNode, NodeResponse, CheckedConsumer<ActionListener<NodesResponse>, Exception>>() {
 
+            final ActionContext actionContext = createActionContext(task, request);
             final ArrayList<NodeResponse> responses = new ArrayList<>(concreteNodes.length);
             final ArrayList<FailedNodeException> exceptions = new ArrayList<>(0);
+            final AtomicBoolean responsesHandled = new AtomicBoolean(false);
 
             final TransportRequestOptions transportRequestOptions = TransportRequestOptions.timeout(request.timeout());
 
@@ -106,12 +111,14 @@ public abstract class TransportNodesAction<
             private void addReleaseOnCancellationListener() {
                 if (task instanceof CancellableTask cancellableTask) {
                     cancellableTask.addListener(() -> {
-                        final List<NodeResponse> drainedResponses;
-                        synchronized (responses) {
-                            drainedResponses = List.copyOf(responses);
-                            responses.clear();
+                        if (responsesHandled.compareAndSet(false, true)) {
+                            final List<NodeResponse> drainedResponses;
+                            synchronized (responses) {
+                                drainedResponses = List.copyOf(responses);
+                                responses.clear();
+                            }
+                            Releasables.wrap(Iterators.map(drainedResponses.iterator(), r -> r::decRef)).close();
                         }
-                        Releasables.wrap(Iterators.map(drainedResponses.iterator(), r -> r::decRef)).close();
                     });
                 }
             }
@@ -158,10 +165,18 @@ public abstract class TransportNodesAction<
 
             @Override
             protected CheckedConsumer<ActionListener<NodesResponse>, Exception> onCompletion() {
-                // ref releases all happen-before here so no need to be synchronized
                 return l -> {
-                    try (var ignored = Releasables.wrap(Iterators.map(responses.iterator(), r -> r::decRef))) {
-                        newResponseAsync(task, request, responses, exceptions, l);
+                    if (responsesHandled.compareAndSet(false, true)) {
+                        // ref releases all happen-before here so no need to be synchronized
+                        try (var ignored = Releasables.wrap(Iterators.map(responses.iterator(), r -> r::decRef))) {
+                            newResponseAsync(task, request, actionContext, responses, exceptions, l);
+                        }
+                    } else {
+                        logger.debug("task cancelled after all responses were collected");
+                        assert task instanceof CancellableTask : "expect CancellableTask, but got: " + task;
+                        final var cancellableTask = (CancellableTask) task;
+                        assert cancellableTask.isCancelled();
+                        cancellableTask.notifyIfCancelled(l);
                     }
                 };
             }
@@ -180,6 +195,16 @@ public abstract class TransportNodesAction<
     private Writeable.Reader<NodeResponse> nodeResponseReader(DiscoveryNode discoveryNode) {
         // not an inline lambda to avoid capturing CancellableFanOut.this.
         return in -> TransportNodesAction.this.newNodeResponse(in, discoveryNode);
+    }
+
+    /**
+     * Create an (optional) {@link ActionContext}: called when starting to execute this action, and the result passed to
+     * {@link #newResponseAsync} on completion. NB runs on the transport worker thread, must not do anything expensive without dispatching
+     * to a different executor.
+     */
+    @Nullable
+    protected ActionContext createActionContext(Task task, NodesRequest request) {
+        return null;
     }
 
     /**
@@ -206,6 +231,7 @@ public abstract class TransportNodesAction<
     protected void newResponseAsync(
         Task task,
         NodesRequest request,
+        ActionContext actionContext,
         List<NodeResponse> responses,
         List<FailedNodeException> failures,
         ActionListener<NodesResponse> listener

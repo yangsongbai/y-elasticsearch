@@ -14,6 +14,7 @@ import org.elasticsearch.action.support.SubscribableListener;
 import org.elasticsearch.common.bytes.BytesArray;
 import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
+import org.elasticsearch.http.HttpBody;
 import org.elasticsearch.http.HttpChannel;
 import org.elasticsearch.http.HttpRequest;
 import org.elasticsearch.http.HttpResponse;
@@ -54,24 +55,22 @@ public class FakeRestRequest extends RestRequest {
 
         private final Method method;
         private final String uri;
-        private final BytesReference content;
         private final Map<String, List<String>> headers;
+        private HttpBody body;
         private final Exception inboundException;
 
-        public FakeHttpRequest(Method method, String uri, BytesReference content, Map<String, List<String>> headers) {
-            this(method, uri, content, headers, null);
+        public FakeHttpRequest(Method method, String uri, BytesReference body, Map<String, List<String>> headers) {
+            this(method, uri, body == null ? HttpBody.empty() : HttpBody.fromBytesReference(body), headers, null);
         }
 
-        private FakeHttpRequest(
-            Method method,
-            String uri,
-            BytesReference content,
-            Map<String, List<String>> headers,
-            Exception inboundException
-        ) {
+        public FakeHttpRequest(Method method, String uri, Map<String, List<String>> headers, HttpBody body) {
+            this(method, uri, body, headers, null);
+        }
+
+        private FakeHttpRequest(Method method, String uri, HttpBody body, Map<String, List<String>> headers, Exception inboundException) {
             this.method = method;
             this.uri = uri;
-            this.content = content == null ? BytesArray.EMPTY : content;
+            this.body = body;
             this.headers = headers;
             this.inboundException = inboundException;
         }
@@ -87,8 +86,13 @@ public class FakeRestRequest extends RestRequest {
         }
 
         @Override
-        public BytesReference content() {
-            return content;
+        public HttpBody body() {
+            return body;
+        }
+
+        @Override
+        public void setBody(HttpBody body) {
+            this.body = body;
         }
 
         @Override
@@ -110,7 +114,22 @@ public class FakeRestRequest extends RestRequest {
         public HttpRequest removeHeader(String header) {
             final var filteredHeaders = new HashMap<>(headers);
             filteredHeaders.remove(header);
-            return new FakeHttpRequest(method, uri, content, filteredHeaders, inboundException);
+            return new FakeHttpRequest(method, uri, body, filteredHeaders, inboundException);
+        }
+
+        public int contentLength() {
+            return switch (body) {
+                case HttpBody.Full f -> f.bytes().length();
+                case HttpBody.Stream s -> {
+                    var len = header("Content-Length");
+                    yield len == null ? 0 : Integer.parseInt(len);
+                }
+            };
+        }
+
+        @Override
+        public boolean hasContent() {
+            return contentLength() > 0;
         }
 
         @Override
@@ -136,11 +155,6 @@ public class FakeRestRequest extends RestRequest {
 
         @Override
         public void release() {}
-
-        @Override
-        public HttpRequest releaseAndCopy() {
-            return this;
-        }
 
         @Override
         public Exception getInboundException() {
@@ -195,7 +209,7 @@ public class FakeRestRequest extends RestRequest {
 
         private Map<String, String> params = new HashMap<>();
 
-        private BytesReference content = BytesArray.EMPTY;
+        private HttpBody content = HttpBody.empty();
 
         private String path = "/";
 
@@ -221,10 +235,20 @@ public class FakeRestRequest extends RestRequest {
         }
 
         public Builder withContent(BytesReference contentBytes, XContentType xContentType) {
-            this.content = contentBytes;
+            this.content = HttpBody.fromBytesReference(contentBytes);
             if (xContentType != null) {
                 headers.put("Content-Type", Collections.singletonList(xContentType.mediaType()));
             }
+            return this;
+        }
+
+        public Builder withBody(HttpBody body) {
+            this.content = body;
+            return this;
+        }
+
+        public Builder withContentLength(int length) {
+            headers.put("Content-Length", List.of(String.valueOf(length)));
             return this;
         }
 

@@ -10,11 +10,8 @@
 package org.elasticsearch.system.indices;
 
 import org.elasticsearch.client.Request;
+import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.Response;
-import org.elasticsearch.common.settings.SecureString;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.util.concurrent.ThreadContext;
-import org.elasticsearch.test.rest.ESRestTestCase;
 import org.junit.After;
 
 import java.io.IOException;
@@ -25,23 +22,18 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
 
-public class SystemAliasIT extends ESRestTestCase {
-    static final String BASIC_AUTH_VALUE = basicAuthHeaderValue("rest_user", new SecureString("rest-user-password".toCharArray()));
+public class SystemAliasIT extends AbstractSystemIndicesIT {
 
     @After
     public void resetFeatures() throws Exception {
-        client().performRequest(new Request("POST", "/_features/_reset"));
-    }
-
-    @Override
-    protected Settings restClientSettings() {
-        return Settings.builder().put(ThreadContext.PREFIX + ".Authorization", BASIC_AUTH_VALUE).build();
+        performPostFeaturesReset(client());
     }
 
     public void testCreatingSystemIndexWithAlias() throws Exception {
         {
             Request request = new Request("PUT", "/.internal-unmanaged-index-8");
             request.setJsonEntity("{\"aliases\": {\".internal-unmanaged-alias\": {}}}");
+            request.setOptions(RequestOptions.DEFAULT.toBuilder().addHeader("X-elastic-product-origin", "elastic"));
             Response response = client().performRequest(request);
             assertThat(response.getStatusLine().getStatusCode(), is(200));
         }
@@ -68,6 +60,7 @@ public class SystemAliasIT extends ESRestTestCase {
 
         {
             Request request = new Request("PUT", "/.internal-unmanaged-index-8");
+            request.setOptions(RequestOptions.DEFAULT.toBuilder().addHeader("X-elastic-product-origin", "elastic"));
             Response response = client().performRequest(request);
             assertThat(response.getStatusLine().getStatusCode(), is(200));
         }
@@ -79,6 +72,7 @@ public class SystemAliasIT extends ESRestTestCase {
     public void testCreatingSystemIndexWithIndexAliasEndpoint() throws Exception {
         {
             Request request = new Request("PUT", "/.internal-unmanaged-index-8");
+            request.setOptions(RequestOptions.DEFAULT.toBuilder().addHeader("X-elastic-product-origin", "elastic"));
             Response response = client().performRequest(request);
             assertThat(response.getStatusLine().getStatusCode(), is(200));
         }
@@ -102,6 +96,7 @@ public class SystemAliasIT extends ESRestTestCase {
     public void testCreatingSystemIndexWithAliasEndpoint() throws Exception {
         {
             Request request = new Request("PUT", "/.internal-unmanaged-index-8");
+            request.setOptions(RequestOptions.DEFAULT.toBuilder().addHeader("X-elastic-product-origin", "elastic"));
             Response response = client().performRequest(request);
             assertThat(response.getStatusLine().getStatusCode(), is(200));
         }
@@ -126,6 +121,7 @@ public class SystemAliasIT extends ESRestTestCase {
     public void testCreatingSystemIndexWithAliasesEndpoint() throws Exception {
         {
             Request request = new Request("PUT", "/.internal-unmanaged-index-8");
+            request.setOptions(RequestOptions.DEFAULT.toBuilder().addHeader("X-elastic-product-origin", "elastic"));
             Response response = client().performRequest(request);
             assertThat(response.getStatusLine().getStatusCode(), is(200));
         }

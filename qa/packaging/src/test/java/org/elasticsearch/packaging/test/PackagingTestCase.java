@@ -145,6 +145,10 @@ public abstract class PackagingTestCase extends Assert {
         @Override
         protected void failed(Throwable e, Description description) {
             failed = true;
+            if (installation != null && installation.distribution.isDocker()) {
+                logger.warn("Test {} failed. Printing logs for failed test...", description.getMethodName());
+                FileUtils.logAllLogs(installation.logs, logger);
+            }
         }
     };
 
@@ -245,7 +249,7 @@ public abstract class PackagingTestCase extends Assert {
                 installation = Packages.installPackage(sh, distribution);
                 Packages.verifyPackageInstallation(installation, distribution, sh);
             }
-            case DOCKER, DOCKER_UBI, DOCKER_IRON_BANK, DOCKER_CLOUD, DOCKER_CLOUD_ESS -> {
+            case DOCKER, DOCKER_IRON_BANK, DOCKER_CLOUD_ESS, DOCKER_WOLFI -> {
                 installation = Docker.runContainer(distribution);
                 Docker.verifyContainerInstallation(installation);
             }
@@ -333,10 +337,9 @@ public abstract class PackagingTestCase extends Assert {
             case RPM:
                 return Packages.runElasticsearchStartCommand(sh);
             case DOCKER:
-            case DOCKER_UBI:
             case DOCKER_IRON_BANK:
-            case DOCKER_CLOUD:
             case DOCKER_CLOUD_ESS:
+            case DOCKER_WOLFI:
                 // nothing, "installing" docker image is running it
                 return Shell.NO_OP;
             default:
@@ -355,10 +358,9 @@ public abstract class PackagingTestCase extends Assert {
                 Packages.stopElasticsearch(sh);
                 break;
             case DOCKER:
-            case DOCKER_UBI:
             case DOCKER_IRON_BANK:
-            case DOCKER_CLOUD:
             case DOCKER_CLOUD_ESS:
+            case DOCKER_WOLFI:
                 // nothing, "installing" docker image is running it
                 break;
             default:
@@ -371,7 +373,7 @@ public abstract class PackagingTestCase extends Assert {
         switch (distribution.packaging) {
             case TAR, ZIP -> Archives.assertElasticsearchStarted(installation);
             case DEB, RPM -> Packages.assertElasticsearchStarted(sh, installation);
-            case DOCKER, DOCKER_UBI, DOCKER_IRON_BANK, DOCKER_CLOUD, DOCKER_CLOUD_ESS -> Docker.waitForElasticsearchToStart();
+            case DOCKER, DOCKER_IRON_BANK, DOCKER_CLOUD_ESS, DOCKER_WOLFI -> Docker.waitForElasticsearchToStart();
             default -> throw new IllegalStateException("Unknown Elasticsearch packaging type.");
         }
     }
