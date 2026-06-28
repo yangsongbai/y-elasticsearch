@@ -6,7 +6,9 @@
 
 **Architecture:** Write-back model — Primary writes locally first (Lucene + Translog), then asynchronously uploads segments after each refresh and translog after each generation roll. A SingleWriterLock prevents split-brain. BackpressureController degrades gracefully when Remote is unavailable. Existing Doc Replication is unchanged.
 
-**Tech Stack:** Java 17, Elasticsearch 7.17.4, BlobStore API (existing), Lucene 8.x Directory abstraction, JUnit 5 (ESTestCase), MinIO for local testing.
+**Tech Stack:** Java 11 (source/target compatibility), Elasticsearch 7.17.4, Lucene 8.11.1, BlobStore API (existing), ESTestCase + Mockito 4.4.0, MinIO for local testing.
+
+**Compatibility note:** ES 7.17.4 targets Java 11. Do NOT use Java records, sealed classes, or pattern matching. Use traditional classes with explicit constructors/getters. `ByteBuffersDirectory` is available in Lucene 8.11.1.
 
 **Scope note:** This is Phase 1 of 4. Phases 2-4 (FileCache, LSR, TieringService, Autoscaler) are separate plans. This phase does NOT modify the read path — queries still use local NVMe only.
 
@@ -320,16 +322,42 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
-public record RemoteSegmentMetadata(
-    long primaryTerm,
-    long generation,
-    long checkpoint,
-    Map<String, FileInfo> files
-) {
+public class RemoteSegmentMetadata {
 
-    public record FileInfo(long size, String checksum) {}
+    private final long primaryTerm;
+    private final long generation;
+    private final long checkpoint;
+    private final Map<String, FileInfo> files;
 
-    public record FileNameParts(long primaryTerm, long generation, long checkpoint) {}
+    public static class FileInfo {
+        private final long size;
+        private final String checksum;
+        public FileInfo(long size, String checksum) { this.size = size; this.checksum = checksum; }
+        public long size() { return size; }
+        public String checksum() { return checksum; }
+    }
+
+    public static class FileNameParts {
+        private final long primaryTerm;
+        private final long generation;
+        private final long checkpoint;
+        public FileNameParts(long primaryTerm, long generation, long checkpoint) {
+            this.primaryTerm = primaryTerm; this.generation = generation; this.checkpoint = checkpoint;
+        }
+        public long primaryTerm() { return primaryTerm; }
+        public long generation() { return generation; }
+        public long checkpoint() { return checkpoint; }
+    }
+
+    public RemoteSegmentMetadata(long primaryTerm, long generation, long checkpoint, Map<String, FileInfo> files) {
+        this.primaryTerm = primaryTerm; this.generation = generation;
+        this.checkpoint = checkpoint; this.files = files;
+    }
+
+    public long primaryTerm() { return primaryTerm; }
+    public long generation() { return generation; }
+    public long checkpoint() { return checkpoint; }
+    public Map<String, FileInfo> files() { return files; }
 
     public String toFileName() {
         return "metadata__" + primaryTerm + "__" + generation + "__" + checkpoint;
