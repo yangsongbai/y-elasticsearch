@@ -53,7 +53,7 @@
 | 温数据 | Remote + FileCache(弹性) | Remote + FileCache | N/A | 本地 HDD |
 | 冷数据 | Remote + 小 FileCache | Remote + FileCache | Searchable Snapshot | Searchable Snapshot |
 | 弹性伸缩 | 秒级(Warm 无状态) | 分钟级 | 手动 | 手动 |
-| 层级流转 | 状态机 + ILM | 手动 + ILM | Snapshot mount | allocate action |
+| 层级流转 | 状态机 + TieringPolicy | 手动 + ILM | Snapshot mount | allocate action |
 
 ### 1.4 关键创新
 
@@ -384,7 +384,7 @@ score = w1*response_time + w2*service_time + w3*queue_size
 
 SharedBlobCache 核心设计:
 - 16MB Region 粒度
-- SparseFileTracker 字节级追踪(支持部分 fetch、合并 fetch)
+- RegionSparseFileTracker 字节级追踪(支持部分 fetch、合并 fetch)
 - LFU + Decay 逐出(频率衰减,防止历史热点永驻)
 - 多请求重叠范围自动合并
 
@@ -481,10 +481,10 @@ CREATING → HOT → HOT_TO_WARM → WARM → WARM_TO_COLD → COLD → ARCHIVED
 
 | From | To | Trigger | 关键动作 |
 |------|-----|---------|---------|
-| HOT | HOT_TO_WARM | ILM(age>7d 等) | flush + Remote sync + read-only + 清零副本 + 改路由 |
+| HOT | HOT_TO_WARM | TieringPolicy(age>7d 等) | flush + Remote sync + read-only + 清零副本 + 改路由 |
 | HOT_TO_WARM | WARM | Warm 副本就绪 | 删 Hot 本地副本,释放 NVMe |
 | HOT_TO_WARM | HOT | rollback | 恢复路由,取消 read-only |
-| WARM | WARM_TO_COLD | ILM(age>30d) | 改路由,缩减缓存策略 |
+| WARM | WARM_TO_COLD | TieringPolicy(age>30d) | 改路由,缩减缓存策略 |
 | WARM_TO_COLD | COLD | Cold 节点就绪 | 同上 |
 | WARM | HOT(反向) | promote_to_hot | 增副本,改路由到 Hot,启用写入 |
 | COLD | ARCHIVED | 手动 archive | 创建 snapshot,删除索引 |
@@ -511,23 +511,35 @@ CREATING → HOT → HOT_TO_WARM → WARM → WARM_TO_COLD → COLD → ARCHIVED
 1. Hot 节点删除本地分片(自动)
 2. 释放 NVMe 空间
 
-### 5.4 ILM 集成
+### 5.4 TieringPolicy 集成(独立于 x-pack ILM)
+
+通过 index settings 声明流转策略,由 `TieringPolicyService` 周期性评估触发:
 
 ```yaml
-PUT _ilm/policy/logs-policy
+PUT logs-2024/_settings
 {
-  "policy": {
-    "phases": {
-      "hot": { "actions": { "rollover": { "max_age": "1d" } } },
-      "warm": { "min_age": "7d", "actions": { "tier": { "target_tier": "warm" } } },
-      "cold": { "min_age": "30d", "actions": { "tier": { "target_tier": "cold" } } },
-      "delete": { "min_age": "90d", "actions": { "delete": {} } }
+  "index.tiering.warm_after": "7d",
+  "index.tiering.cold_after": "30d",
+  "index.tiering.delete_after": "90d"
+}
+```
+
+或通过 index template 统一配置:
+
+```yaml
+PUT _index_template/logs-template
+{
+  "index_patterns": ["logs-*"],
+  "template": {
+    "settings": {
+      "index.tiering.warm_after": "7d",
+      "index.tiering.cold_after": "30d"
     }
   }
 }
 ```
 
-自定义 `TierAction` 作为 LifecycleAction 嵌入 ILM 框架。
+`TieringPolicyService` 作为 `ClusterStateListener` + 定时调度(默认 5min 间隔),遍历所有启用 tiering 的索引,比较 `index.creation_date` + 配置的 age 条件,满足时调用 `TieringService.transitionIndex()`。全部实现在 server 模块中,**不依赖 x-pack ILM**。
 
 ### 5.5 服务连续性
 
@@ -871,7 +883,7 @@ index.indexing.slowlog.threshold.index.warn: 500ms
 | Phase | 时间 | 目标 | 关键交付 |
 |-------|------|------|---------|
 | Phase 1 | M0-M3 | 基础存算分离 | Remote Store write-back, Doc Replication, Hot+Remote |
-| Phase 2 | M3-M6 | 分层架构 | Warm/Cold+FileCache, LSR, TieringService, ILM |
+| Phase 2 | M3-M6 | 分层架构 | Warm/Cold+FileCache, LSR, TieringService, TieringPolicy |
 | Phase 3 | M6-M9 | 智能弹性 | Autoscaler, K8s/ECK, promote_to_hot, 大促编排 |
 | Phase 4 | M9-M12 | 极致优化 | 跨 Region DR, PITR, Prefetch, OTel, 混沌工程 |
 
@@ -898,10 +910,10 @@ index.indexing.slowlog.threshold.index.warn: 500ms
 **任务**:
 - M3-M4(4周):SharedBlobCache + SparseFileTracker + LayeredIndexInput + LFU
 - M4-M5(4周):LayeredDirectory + TailDirectory + LeanSyncReplicaEngine + LUS broadcast
-- M5-M6(4周):TieringService 状态机 + HotToWarm/WarmToCold + ILM 集成
+- M5-M6(4周):TieringService 状态机 + HotToWarm/WarmToCold + TieringPolicy 集成
 
 **验收**:
-- ILM 自动 Hot→Warm→Cold
+- TieringPolicy 自动 Hot→Warm→Cold
 - 流转期间查询不中断
 - LSR 存储 ≤ 全量 15%
 - Warm P99 ≤ 200ms(cache hit 80%+)

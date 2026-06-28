@@ -4,9 +4,9 @@
 
 **Goal:** Introduce Warm/Cold tiers with SharedBlobCache, Lean Sync Replica (LSR) to reduce Hot storage cost by 85%, and TieringService state machine for automated Hot->Warm->Cold index lifecycle transitions.
 
-**Architecture:** Warm/Cold nodes read segments directly from Remote Store via a SharedBlobCache (16MB region, LFU+Decay eviction). LSR on Hot nodes stores only uncommitted tail data locally, using LayeredDirectory to transparently merge tail + Remote. TieringService manages transitions as a state machine integrated with ILM.
+**Architecture:** Warm/Cold nodes read segments directly from Remote Store via a SharedBlobCache (16MB region, LFU+Decay eviction). LSR on Hot nodes stores only uncommitted tail data locally, using LayeredDirectory to transparently merge tail + Remote. TieringService manages transitions as a state machine, triggered by TieringPolicyService (age-based index settings evaluation).
 
-**Tech Stack:** Java 11 (source/target compatibility), Elasticsearch 7.17.4, Lucene 8.11.1, existing SparseFileTracker (x-pack), Lucene Directory abstraction, ILM LifecycleAction framework, ClusterState metadata, Mockito 4.4.0.
+**Tech Stack:** Java 11 (source/target compatibility), Elasticsearch 7.17.4, Lucene 8.11.1, Lucene Directory abstraction, ClusterStateListener + ThreadPool scheduler, ClusterState metadata, Mockito 4.4.0.
 
 **Compatibility note:** ES 7.17.4 targets Java 11. Do NOT use Java records, sealed classes, or pattern matching. Convert all `record` declarations in this plan to traditional classes with constructors and getters. `ByteBuffersDirectory` is available in Lucene 8.11.1.
 
@@ -22,7 +22,7 @@
 |------|---------------|
 | `server/.../index/remote/cache/SharedBlobCacheService.java` | Region-based file cache over SSD, LFU+Decay eviction |
 | `server/.../index/remote/cache/CacheRegion.java` | 16MB fixed-size region unit |
-| `server/.../index/remote/cache/RegionSparseFileTracker.java` | Byte-level tracking within a region (reuse logic from x-pack SparseFileTracker) |
+| `server/.../index/remote/cache/RegionSparseFileTracker.java` | Byte-level tracking within a region (self-contained TreeSet<Range> implementation) |
 | `server/.../index/remote/cache/LFUDecayPolicy.java` | LFU with time-decay eviction policy |
 | `server/.../index/remote/cache/FileCacheSettings.java` | `node.filecache.*` settings |
 | `server/.../index/remote/directory/LayeredDirectory.java` | Transparent merge of tail (local) + remote (cached) Directory |
@@ -35,9 +35,9 @@
 | `server/.../index/remote/tiering/TieringState.java` | Enum: HOT, HOT_TO_WARM, WARM, WARM_TO_COLD, COLD, ARCHIVED |
 | `server/.../index/remote/tiering/TieringMetadata.java` | Custom IndexMetadata extension for tier state |
 | `server/.../index/remote/tiering/TierTransitioner.java` | Executes transition phases (flush, sync, route change) |
-| `server/.../index/remote/tiering/TierAction.java` | ILM LifecycleAction for `tier` action |
-| `server/.../index/remote/tiering/TierActionStep.java` | ILM Step that invokes TieringService |
-| `server/.../index/remote/tiering/WaitForTierStep.java` | ILM AsyncWaitStep polling tier state |
+| `server/.../index/remote/tiering/TierAction.java` | TieringPolicyService trigger action — evaluates age conditions |
+| `server/.../index/remote/tiering/TieringPolicyService.java` | Periodic ClusterStateListener that evaluates tiering policies |
+| `server/.../index/remote/tiering/TieringPolicySettings.java` | Settings: index.tiering.warm_after, cold_after, delete_after |
 | Tests: one test file per production class above |
 
 ### Existing files to modify:
@@ -50,7 +50,6 @@
 | `server/.../common/settings/IndexScopedSettings.java` | Register new index settings (tiering, cache) |
 | `server/.../common/settings/ClusterSettings.java` | Register new cluster settings |
 | `server/.../node/Node.java` | Initialize SharedBlobCacheService |
-| `x-pack/.../xpack/core/ilm/TimeseriesLifecycleType.java` | Register TierAction in allowed actions |
 
 ---
 
@@ -1609,195 +1608,308 @@ git commit -m "feat(tiering): add TieringService state machine with rollback sup
 
 ---
 
-## Task 11: TierAction (ILM integration)
+## Task 11: TieringPolicyService (standalone tiering trigger, no x-pack)
 
 **Files:**
-- Create: `server/src/main/java/org/elasticsearch/index/remote/tiering/TierAction.java`
-- Test: `server/src/test/java/org/elasticsearch/index/remote/tiering/TierActionTests.java`
+- Create: `server/src/main/java/org/elasticsearch/index/remote/tiering/TieringPolicySettings.java`
+- Create: `server/src/main/java/org/elasticsearch/index/remote/tiering/TieringPolicyService.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/tiering/TieringPolicyServiceTests.java`
+- Modify: `server/src/main/java/org/elasticsearch/common/settings/IndexScopedSettings.java`
 
 - [ ] **Step 1: Write the failing test**
 
 ```java
 package org.elasticsearch.index.remote.tiering;
 
-import org.elasticsearch.common.io.stream.BytesStreamOutput;
-import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.Metadata;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.threadpool.TestThreadPool;
+import org.elasticsearch.threadpool.ThreadPool;
 
-import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
 
-public class TierActionTests extends ESTestCase {
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
-    public void testSerialization() throws IOException {
-        TierAction action = new TierAction("warm");
+public class TieringPolicyServiceTests extends ESTestCase {
 
-        BytesStreamOutput out = new BytesStreamOutput();
-        action.writeTo(out);
-        StreamInput in = out.bytes().streamInput();
-        TierAction parsed = new TierAction(in);
+    private ThreadPool threadPool;
 
-        assertEquals("warm", parsed.getTargetTier());
-        assertEquals(TierAction.NAME, parsed.getWriteableName());
+    @Override
+    public void setUp() throws Exception {
+        super.setUp();
+        threadPool = new TestThreadPool("test");
     }
 
-    public void testIsSafe() {
-        TierAction action = new TierAction("warm");
-        assertTrue(action.isSafeAction());
+    @Override
+    public void tearDown() throws Exception {
+        threadPool.shutdownNow();
+        super.tearDown();
     }
 
-    public void testToStepsProducesSteps() {
-        TierAction action = new TierAction("cold");
-        var steps = action.toSteps(null, "warm", null);
-        assertFalse(steps.isEmpty());
+    public void testSettingsParsed() {
+        Settings settings = Settings.builder()
+            .put(TieringPolicySettings.WARM_AFTER.getKey(), "7d")
+            .put(TieringPolicySettings.COLD_AFTER.getKey(), "30d")
+            .put(TieringPolicySettings.DELETE_AFTER.getKey(), "90d")
+            .build();
+        assertEquals(7 * 24 * 60 * 60 * 1000L,
+            TieringPolicySettings.WARM_AFTER.get(settings).millis());
+        assertEquals(30 * 24 * 60 * 60 * 1000L,
+            TieringPolicySettings.COLD_AFTER.get(settings).millis());
+    }
+
+    public void testEvaluatesIndexAge() {
+        long nowMillis = System.currentTimeMillis();
+        long eightDaysAgo = nowMillis - (8L * 24 * 60 * 60 * 1000);
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_INDEX_UUID, "test-uuid")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_VERSION_CREATED, org.elasticsearch.Version.CURRENT)
+            .put(IndexMetadata.SETTING_CREATION_DATE, eightDaysAgo)
+            .put(TieringPolicySettings.WARM_AFTER.getKey(), "7d")
+            .build();
+
+        IndexMetadata indexMetadata = IndexMetadata.builder("logs-2024")
+            .settings(indexSettings)
+            .build();
+
+        AtomicInteger transitionCalls = new AtomicInteger(0);
+        TieringService mockTieringService = mock(TieringService.class);
+
+        TieringPolicyService policyService = new TieringPolicyService(
+            threadPool, mock(ClusterService.class), mockTieringService);
+
+        boolean shouldTransition = policyService.shouldTransition(indexMetadata, TieringState.HOT, "warm");
+        assertTrue(shouldTransition);
+    }
+
+    public void testDoesNotTransitionYoungIndex() {
+        long nowMillis = System.currentTimeMillis();
+        long twoDaysAgo = nowMillis - (2L * 24 * 60 * 60 * 1000);
+
+        Settings indexSettings = Settings.builder()
+            .put(IndexMetadata.SETTING_INDEX_UUID, "test-uuid")
+            .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
+            .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
+            .put(IndexMetadata.SETTING_VERSION_CREATED, org.elasticsearch.Version.CURRENT)
+            .put(IndexMetadata.SETTING_CREATION_DATE, twoDaysAgo)
+            .put(TieringPolicySettings.WARM_AFTER.getKey(), "7d")
+            .build();
+
+        IndexMetadata indexMetadata = IndexMetadata.builder("logs-2024")
+            .settings(indexSettings)
+            .build();
+
+        TieringService mockTieringService = mock(TieringService.class);
+        TieringPolicyService policyService = new TieringPolicyService(
+            threadPool, mock(ClusterService.class), mockTieringService);
+
+        boolean shouldTransition = policyService.shouldTransition(indexMetadata, TieringState.HOT, "warm");
+        assertFalse(shouldTransition);
     }
 }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.tiering.TierActionTests" -x javadoc`
-Expected: Compilation error
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.tiering.TieringPolicyServiceTests" -x javadoc`
+Expected: Compilation error — TieringPolicySettings, TieringPolicyService not found
 
-- [ ] **Step 3: Write TierAction**
+- [ ] **Step 3: Write TieringPolicySettings**
 
 ```java
 package org.elasticsearch.index.remote.tiering;
 
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.io.stream.StreamInput;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.core.Nullable;
-import org.elasticsearch.xcontent.XContentBuilder;
-import org.elasticsearch.xpack.core.ilm.LifecycleAction;
-import org.elasticsearch.xpack.core.ilm.Step;
+import org.elasticsearch.common.settings.Setting;
+import org.elasticsearch.common.unit.TimeValue;
+
+public final class TieringPolicySettings {
+
+    public static final Setting<TimeValue> WARM_AFTER = Setting.timeSetting(
+        "index.tiering.warm_after",
+        TimeValue.timeValueMillis(-1),
+        TimeValue.timeValueMillis(-1),
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<TimeValue> COLD_AFTER = Setting.timeSetting(
+        "index.tiering.cold_after",
+        TimeValue.timeValueMillis(-1),
+        TimeValue.timeValueMillis(-1),
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<TimeValue> DELETE_AFTER = Setting.timeSetting(
+        "index.tiering.delete_after",
+        TimeValue.timeValueMillis(-1),
+        TimeValue.timeValueMillis(-1),
+        Setting.Property.IndexScope,
+        Setting.Property.Dynamic
+    );
+
+    public static final Setting<TimeValue> EVALUATION_INTERVAL = Setting.timeSetting(
+        "cluster.tiering.evaluation_interval",
+        TimeValue.timeValueMinutes(5),
+        TimeValue.timeValueMinutes(1),
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    private TieringPolicySettings() {}
+}
+```
+
+- [ ] **Step 4: Write TieringPolicyService**
+
+```java
+package org.elasticsearch.index.remote.tiering;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.cluster.ClusterChangedEvent;
+import org.elasticsearch.cluster.ClusterStateListener;
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.service.ClusterService;
+import org.elasticsearch.common.component.AbstractLifecycleComponent;
+import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.threadpool.Scheduler;
+import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
-import java.util.List;
+import java.util.Map;
 
-public class TierAction implements LifecycleAction {
+public class TieringPolicyService extends AbstractLifecycleComponent implements ClusterStateListener {
 
-    public static final String NAME = "tier";
+    private static final Logger logger = LogManager.getLogger(TieringPolicyService.class);
 
-    private final String targetTier;
+    private final ThreadPool threadPool;
+    private final ClusterService clusterService;
+    private final TieringService tieringService;
+    private volatile Scheduler.Cancellable scheduledTask;
 
-    public TierAction(String targetTier) {
-        this.targetTier = targetTier;
-    }
-
-    public TierAction(StreamInput in) throws IOException {
-        this.targetTier = in.readString();
-    }
-
-    public String getTargetTier() { return targetTier; }
-
-    @Override
-    public List<Step> toSteps(Client client, String phase, @Nullable Step.StepKey nextStepKey) {
-        Step.StepKey tierStepKey = new Step.StepKey(phase, NAME, "tier-transition");
-        Step.StepKey waitStepKey = new Step.StepKey(phase, NAME, "wait-for-tier");
-        return List.of(
-            new TierActionStep(tierStepKey, waitStepKey, client, targetTier),
-            new WaitForTierStep(waitStepKey, nextStepKey, targetTier)
-        );
+    public TieringPolicyService(ThreadPool threadPool, ClusterService clusterService,
+                                TieringService tieringService) {
+        this.threadPool = threadPool;
+        this.clusterService = clusterService;
+        this.tieringService = tieringService;
     }
 
     @Override
-    public boolean isSafeAction() { return true; }
-
-    @Override
-    public String getWriteableName() { return NAME; }
-
-    @Override
-    public void writeTo(StreamOutput out) throws IOException {
-        out.writeString(targetTier);
+    protected void doStart() {
+        clusterService.addListener(this);
+        scheduleEvaluation();
     }
 
     @Override
-    public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        builder.startObject();
-        builder.field("target_tier", targetTier);
-        builder.endObject();
-        return builder;
+    protected void doStop() {
+        if (scheduledTask != null) {
+            scheduledTask.cancel();
+        }
+        clusterService.removeListener(this);
+    }
+
+    @Override
+    protected void doClose() throws IOException {}
+
+    @Override
+    public void clusterChanged(ClusterChangedEvent event) {
+        if (event.localNodeMaster() == false) {
+            return;
+        }
+    }
+
+    private void scheduleEvaluation() {
+        TimeValue interval = TieringPolicySettings.EVALUATION_INTERVAL.get(
+            clusterService.getSettings());
+        scheduledTask = threadPool.schedule(this::evaluateAll, interval, ThreadPool.Names.GENERIC);
+    }
+
+    private void evaluateAll() {
+        if (clusterService.state().nodes().isLocalNodeElectedMaster() == false) {
+            scheduleEvaluation();
+            return;
+        }
+        try {
+            Map<String, IndexMetadata> indices = clusterService.state().metadata().indices();
+            for (Map.Entry<String, IndexMetadata> entry : indices.entrySet()) {
+                evaluateIndex(entry.getValue());
+            }
+        } finally {
+            scheduleEvaluation();
+        }
+    }
+
+    private void evaluateIndex(IndexMetadata indexMetadata) {
+        TieringState currentState = TieringMetadata.getState(indexMetadata);
+        if (currentState == null || currentState.isTransitioning()) {
+            return;
+        }
+
+        if (currentState == TieringState.HOT && shouldTransition(indexMetadata, currentState, "warm")) {
+            tieringService.transitionIndex(indexMetadata.getIndex().getName(), TieringState.WARM);
+        } else if (currentState == TieringState.WARM && shouldTransition(indexMetadata, currentState, "cold")) {
+            tieringService.transitionIndex(indexMetadata.getIndex().getName(), TieringState.COLD);
+        }
+    }
+
+    public boolean shouldTransition(IndexMetadata indexMetadata, TieringState currentState, String targetTier) {
+        long creationDate = indexMetadata.getCreationDate();
+        if (creationDate <= 0) {
+            return false;
+        }
+        long ageMillis = System.currentTimeMillis() - creationDate;
+
+        TimeValue threshold;
+        if ("warm".equals(targetTier)) {
+            threshold = TieringPolicySettings.WARM_AFTER.get(indexMetadata.getSettings());
+        } else if ("cold".equals(targetTier)) {
+            threshold = TieringPolicySettings.COLD_AFTER.get(indexMetadata.getSettings());
+        } else {
+            return false;
+        }
+
+        if (threshold.millis() <= 0) {
+            return false;
+        }
+
+        return ageMillis >= threshold.millis();
     }
 }
 ```
 
-- [ ] **Step 4: Write stub TierActionStep and WaitForTierStep**
+- [ ] **Step 5: Register settings in IndexScopedSettings**
+
+Add to `server/src/main/java/org/elasticsearch/common/settings/IndexScopedSettings.java`:
 
 ```java
-// TierActionStep.java
-package org.elasticsearch.index.remote.tiering;
-
-import org.elasticsearch.client.Client;
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.metadata.IndexMetadata;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.xpack.core.ilm.AsyncActionStep;
-import org.elasticsearch.xpack.core.ilm.Step;
-
-public class TierActionStep extends AsyncActionStep {
-
-    private final String targetTier;
-
-    public TierActionStep(StepKey key, StepKey nextStepKey, Client client, String targetTier) {
-        super(key, nextStepKey, client);
-        this.targetTier = targetTier;
-    }
-
-    @Override
-    public void performAction(IndexMetadata indexMetadata, ClusterState currentState,
-                              ClusterStateObserver observer, ActionListener listener) {
-        // Invoke TieringService.transitionIndex()
-        listener.onResponse(true);
-    }
-
-    @Override
-    public boolean isRetryable() { return true; }
-}
+// Add to the BUILT_IN_INDEX_SETTINGS set:
+TieringPolicySettings.WARM_AFTER,
+TieringPolicySettings.COLD_AFTER,
+TieringPolicySettings.DELETE_AFTER,
 ```
 
-```java
-// WaitForTierStep.java
-package org.elasticsearch.index.remote.tiering;
+- [ ] **Step 6: Run test to verify it passes**
 
-import org.elasticsearch.cluster.ClusterState;
-import org.elasticsearch.cluster.metadata.IndexMetadata;
-import org.elasticsearch.index.Index;
-import org.elasticsearch.xpack.core.ilm.ClusterStateWaitStep;
-import org.elasticsearch.xpack.core.ilm.Step;
-
-public class WaitForTierStep extends ClusterStateWaitStep {
-
-    private final String targetTier;
-
-    public WaitForTierStep(StepKey key, StepKey nextStepKey, String targetTier) {
-        super(key, nextStepKey);
-        this.targetTier = targetTier;
-    }
-
-    @Override
-    public Result isConditionMet(Index index, ClusterState clusterState) {
-        // Check TieringMetadata in ClusterState for target tier reached
-        return new Result(true, null);
-    }
-
-    @Override
-    public boolean isRetryable() { return true; }
-}
-```
-
-- [ ] **Step 5: Run test to verify it passes**
-
-Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.tiering.TierActionTests" -x javadoc`
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.tiering.TieringPolicyServiceTests" -x javadoc`
 Expected: All 3 tests PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add server/src/main/java/org/elasticsearch/index/remote/tiering/TierAction.java \
-        server/src/main/java/org/elasticsearch/index/remote/tiering/TierActionStep.java \
-        server/src/main/java/org/elasticsearch/index/remote/tiering/WaitForTierStep.java \
-        server/src/test/java/org/elasticsearch/index/remote/tiering/TierActionTests.java
-git commit -m "feat(tiering): add TierAction ILM integration with steps"
+git add server/src/main/java/org/elasticsearch/index/remote/tiering/TieringPolicySettings.java \
+        server/src/main/java/org/elasticsearch/index/remote/tiering/TieringPolicyService.java \
+        server/src/test/java/org/elasticsearch/index/remote/tiering/TieringPolicyServiceTests.java \
+        server/src/main/java/org/elasticsearch/common/settings/IndexScopedSettings.java
+git commit -m "feat(tiering): add TieringPolicyService for age-based tier transitions (no x-pack)"
 ```
 
 ---
