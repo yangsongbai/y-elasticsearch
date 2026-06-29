@@ -79,6 +79,7 @@ import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexingPressure;
 import org.elasticsearch.index.remote.RemoteStoreSettings;
 import org.elasticsearch.index.remote.cache.FileCacheSettings;
+import org.elasticsearch.index.remote.tiering.TieringPolicySettings;
 import org.elasticsearch.indices.IndexingMemoryController;
 import org.elasticsearch.indices.IndicesQueryCache;
 import org.elasticsearch.indices.IndicesRequestCache;
@@ -355,6 +356,7 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 FileCacheSettings.EVICTION_POLICY,
                 FileCacheSettings.DECAY_INTERVAL,
                 FileCacheSettings.DECAY_FACTOR,
+                TieringPolicySettings.EVALUATION_INTERVAL,
                 ClusterApplierService.CLUSTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,
                 ClusterService.USER_DEFINED_METADATA,
                 MasterService.MASTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,

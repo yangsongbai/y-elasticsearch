@@ -31,6 +31,7 @@ import org.elasticsearch.index.fielddata.IndexFieldDataService;
 import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.mapper.MapperService;
 import org.elasticsearch.index.remote.RemoteStoreSettings;
+import org.elasticsearch.index.remote.tiering.TieringPolicySettings;
 import org.elasticsearch.index.similarity.SimilarityService;
 import org.elasticsearch.index.store.FsDirectoryFactory;
 import org.elasticsearch.index.store.Store;
@@ -177,6 +178,9 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 RemoteStoreSettings.TRANSLOG_PARALLEL_UPLOAD,
                 RemoteStoreSettings.RELOCATION_HANDOFF_TIMEOUT,
                 RemoteStoreSettings.RELOCATION_MAX_TAIL_AT_HANDOFF,
+                TieringPolicySettings.WARM_AFTER,
+                TieringPolicySettings.COLD_AFTER,
+                TieringPolicySettings.DELETE_AFTER,
 
                 // validate that built-in similarities don't get redefined
                 Setting.groupSetting("index.similarity.", (s) -> {
