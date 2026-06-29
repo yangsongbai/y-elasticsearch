@@ -1,0 +1,48 @@
+cluster:
+  name: es-remote-store
+
+image:
+  repository: elasticsearch
+  tag: 7.17.4-remote-store
+  pullPolicy: IfNotPresent
+
+master:
+  replicas: 3
+  resources:
+    requests: { cpu: "2", memory: "8Gi" }
+    limits: { cpu: "4", memory: "16Gi" }
+
+hot:
+  replicas: 3
+  resources:
+    requests: { cpu: "8", memory: "64Gi" }
+    limits: { cpu: "16", memory: "128Gi" }
+  storage:
+    size: 3750Gi
+    storageClass: local-nvme
+
+warm:
+  replicas: 3
+  resources:
+    requests: { cpu: "2", memory: "16Gi" }
+    limits: { cpu: "4", memory: "32Gi" }
+  cache:
+    size: 200Gi
+  hpa:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 50
+    targetP99Ms: 200
+
+cold:
+  replicas: 2
+  resources:
+    requests: { cpu: "1", memory: "2Gi" }
+    limits: { cpu: "2", memory: "4Gi" }
+  cache:
+    size: 50Gi
+
+remoteStore:
+  repository: s3-main
+  bucket: es-remote-data
+  region: us-east-1

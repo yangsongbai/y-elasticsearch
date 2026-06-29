@@ -1,0 +1,10 @@
+apiVersion: v2
+name: es-remote-store
+description: Elasticsearch 7.17.4 with storage-compute separation
+type: application
+version: 1.0.0
+appVersion: "7.17.4"
+keywords:
+  - elasticsearch
+  - remote-store
+  - storage-compute-separation

@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-warm
+spec:
+  replicas: {{ .Values.warm.replicas }}
+  selector:
+    matchLabels:
+      app: elasticsearch
+      role: data_warm
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        role: data_warm
+    spec:
+      containers:
+        - name: elasticsearch
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          env:
+            - name: node.roles
+              value: "data_warm,search"
+            - name: node.filecache.size
+              value: "{{ .Values.warm.cache.size }}"
+          resources:
+            requests: {{ toYaml .Values.warm.resources.requests | nindent 14 }}
+            limits: {{ toYaml .Values.warm.resources.limits | nindent 14 }}
+---
+{{- if .Values.warm.hpa.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-warm-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ .Release.Name }}-warm
+  minReplicas: {{ .Values.warm.hpa.minReplicas }}
+  maxReplicas: {{ .Values.warm.hpa.maxReplicas }}
+  metrics:
+    - type: Pods
+      pods:
+        metric:
+          name: es_search_latency_p99_ms
+        target:
+          type: AverageValue
+          averageValue: "{{ .Values.warm.hpa.targetP99Ms }}"
+{{- end }}
