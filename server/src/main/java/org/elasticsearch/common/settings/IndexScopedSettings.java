@@ -30,6 +30,7 @@ import org.elasticsearch.index.engine.EngineConfig;
 import org.elasticsearch.index.fielddata.IndexFieldDataService;
 import org.elasticsearch.index.mapper.FieldMapper;
 import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.index.remote.RemoteStoreSettings;
 import org.elasticsearch.index.similarity.SimilarityService;
 import org.elasticsearch.index.store.FsDirectoryFactory;
 import org.elasticsearch.index.store.Store;
@@ -169,6 +170,13 @@ public final class IndexScopedSettings extends AbstractScopedSettings {
                 DiskThresholdDecider.SETTING_IGNORE_DISK_WATERMARKS,
                 ShardLimitValidator.INDEX_SETTING_SHARD_LIMIT_GROUP,
                 DataTier.TIER_PREFERENCE_SETTING,
+                RemoteStoreSettings.REMOTE_STORE_ENABLED,
+                RemoteStoreSettings.REMOTE_STORE_REPOSITORY,
+                RemoteStoreSettings.TRANSLOG_UPLOAD_INTERVAL,
+                RemoteStoreSettings.TRANSLOG_UPLOAD_BATCH_SIZE,
+                RemoteStoreSettings.TRANSLOG_PARALLEL_UPLOAD,
+                RemoteStoreSettings.RELOCATION_HANDOFF_TIMEOUT,
+                RemoteStoreSettings.RELOCATION_MAX_TAIL_AT_HANDOFF,
 
                 // validate that built-in similarities don't get redefined
                 Setting.groupSetting("index.similarity.", (s) -> {

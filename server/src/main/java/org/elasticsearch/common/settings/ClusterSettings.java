@@ -77,6 +77,7 @@ import org.elasticsearch.http.HttpTransportSettings;
 import org.elasticsearch.index.IndexModule;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexingPressure;
+import org.elasticsearch.index.remote.RemoteStoreSettings;
 import org.elasticsearch.indices.IndexingMemoryController;
 import org.elasticsearch.indices.IndicesQueryCache;
 import org.elasticsearch.indices.IndicesRequestCache;
@@ -330,6 +331,24 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 HierarchyCircuitBreakerService.ACCOUNTING_CIRCUIT_BREAKER_LIMIT_SETTING,
                 HierarchyCircuitBreakerService.ACCOUNTING_CIRCUIT_BREAKER_OVERHEAD_SETTING,
                 IndexModule.NODE_STORE_ALLOW_MMAP,
+                RemoteStoreSettings.SEGMENT_UPLOAD_PARALLELISM,
+                RemoteStoreSettings.SEGMENT_UPLOAD_MAX_BYTES_IN_FLIGHT,
+                RemoteStoreSettings.BACKPRESSURE_WARN_THRESHOLD,
+                RemoteStoreSettings.BACKPRESSURE_BLOCK_THRESHOLD,
+                RemoteStoreSettings.FAILURE_CONSECUTIVE_THRESHOLD,
+                RemoteStoreSettings.SINGLE_WRITER_ENABLED,
+                RemoteStoreSettings.SINGLE_WRITER_HEARTBEAT_INTERVAL,
+                RemoteStoreSettings.SINGLE_WRITER_LEASE_TOLERANCE,
+                RemoteStoreSettings.SINGLE_WRITER_DEGRADE_AFTER_FAILURES,
+                RemoteStoreSettings.SINGLE_WRITER_LOCK_ATTEMPT_TIMEOUT,
+                RemoteStoreSettings.SINGLE_WRITER_FAST_DEGRADE,
+                RemoteStoreSettings.RELOCATION_FORCE_UPLOAD,
+                RemoteStoreSettings.FAST_FAILOVER_ENABLED,
+                RemoteStoreSettings.FAST_FAILOVER_KNOWN_DEAD_TIMEOUT,
+                RemoteStoreSettings.PRIMARY_PROMOTION_CONCURRENT,
+                RemoteStoreSettings.PRIMARY_PROMOTION_BATCH_INTERVAL,
+                RemoteStoreSettings.PRIMARY_PROMOTION_PRESELECT,
+                RemoteStoreSettings.PRIMARY_SHARDS_PER_NODE,
                 ClusterApplierService.CLUSTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,
                 ClusterService.USER_DEFINED_METADATA,
                 MasterService.MASTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,

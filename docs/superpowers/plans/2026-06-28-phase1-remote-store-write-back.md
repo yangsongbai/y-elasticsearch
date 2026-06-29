@@ -1856,7 +1856,1240 @@ Expected: No new failures
 - [ ] **Step 4: Commit final state**
 
 ```bash
-git commit --allow-empty -m "chore(remote-store): Phase 1 Remote Store write-back complete"
+git add -A
+git commit -m "chore(remote-store): Phase 1 core Remote Store write-back complete"
+```
+
+---
+
+## Task 13: SingleWriterLock Lease Tolerance & Fast Degrade
+
+> **Risk mitigation:** §8.7.1(S-1) + §8.10.6(改进2) — 续约容忍窗口 + 快速降级，防止 Remote 不可达时写入长时间中断
+
+**Files:**
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/SingleWriterLock.java`
+- Create: `server/src/main/java/org/elasticsearch/index/remote/SingleWriterLockConfig.java`
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/SingleWriterLockLeaseTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.common.blobstore.BlobContainer;
+import org.elasticsearch.test.ESTestCase;
+
+import java.io.IOException;
+import java.nio.file.NoSuchFileException;
+
+import static org.mockito.Mockito.*;
+
+public class SingleWriterLockLeaseTests extends ESTestCase {
+
+    public void testLeaseToleranceAllowsTransientFailure() throws IOException {
+        BlobContainer container = mock(BlobContainer.class);
+        SingleWriterLockConfig config = new SingleWriterLockConfig(
+            30000L,  // lease_tolerance: 30s
+            2,       // degrade_after_failures: 2
+            5000L,   // lock_attempt_timeout: 5s
+            true     // fast_degrade_on_first_failure
+        );
+        SingleWriterLock lock = new SingleWriterLock(container, config);
+
+        // First acquire succeeds
+        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        assertTrue(lock.tryAcquire(1L, "node-1"));
+
+        // Simulate renewal failure (Remote unreachable)
+        when(container.writeBlob(anyString(), any(), anyLong(), anyBoolean()))
+            .thenThrow(new IOException("connection refused"));
+
+        // First renewal failure: should NOT trigger degrade yet
+        SingleWriterLock.RenewResult result1 = lock.tryRenew(1L, "node-1");
+        assertEquals(SingleWriterLock.RenewResult.FAILED_TOLERABLE, result1);
+        assertTrue(lock.isHeldLocally()); // still considered held within tolerance
+
+        // Second renewal failure: triggers degrade
+        SingleWriterLock.RenewResult result2 = lock.tryRenew(1L, "node-1");
+        assertEquals(SingleWriterLock.RenewResult.DEGRADED, result2);
+        assertTrue(lock.isDegraded());
+    }
+
+    public void testDegradedModeAllowsLocalWrites() throws IOException {
+        BlobContainer container = mock(BlobContainer.class);
+        SingleWriterLockConfig config = new SingleWriterLockConfig(30000L, 2, 5000L, true);
+        SingleWriterLock lock = new SingleWriterLock(container, config);
+
+        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        lock.tryAcquire(1L, "node-1");
+
+        // Force into degraded state
+        when(container.writeBlob(anyString(), any(), anyLong(), anyBoolean()))
+            .thenThrow(new IOException("timeout"));
+        lock.tryRenew(1L, "node-1"); // fail 1
+        lock.tryRenew(1L, "node-1"); // fail 2 → degraded
+
+        assertTrue(lock.isDegraded());
+        assertTrue(lock.allowWriteInDegradedMode());
+    }
+
+    public void testRecoveryFromDegradedMode() throws IOException {
+        BlobContainer container = mock(BlobContainer.class);
+        SingleWriterLockConfig config = new SingleWriterLockConfig(30000L, 2, 5000L, true);
+        SingleWriterLock lock = new SingleWriterLock(container, config);
+
+        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        lock.tryAcquire(1L, "node-1");
+
+        // Enter degraded mode
+        when(container.writeBlob(anyString(), any(), anyLong(), anyBoolean()))
+            .thenThrow(new IOException("timeout"));
+        lock.tryRenew(1L, "node-1");
+        lock.tryRenew(1L, "node-1");
+        assertTrue(lock.isDegraded());
+
+        // Remote recovers
+        reset(container);
+        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+
+        SingleWriterLock.RenewResult result = lock.tryRenew(1L, "node-1");
+        assertEquals(SingleWriterLock.RenewResult.SUCCESS, result);
+        assertFalse(lock.isDegraded());
+    }
+
+    public void testLeaseToleranceWindowExpiry() throws Exception {
+        BlobContainer container = mock(BlobContainer.class);
+        // Very short tolerance for testing
+        SingleWriterLockConfig config = new SingleWriterLockConfig(100L, 5, 5000L, false);
+        SingleWriterLock lock = new SingleWriterLock(container, config);
+
+        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        lock.tryAcquire(1L, "node-1");
+
+        // Simulate tolerance window expiry without fast_degrade
+        when(container.writeBlob(anyString(), any(), anyLong(), anyBoolean()))
+            .thenThrow(new IOException("timeout"));
+        // With fast_degrade=false, need to exceed tolerance window
+        Thread.sleep(150); // exceed 100ms tolerance
+        SingleWriterLock.RenewResult result = lock.tryRenew(1L, "node-1");
+        assertEquals(SingleWriterLock.RenewResult.LEASE_EXPIRED, result);
+        assertFalse(lock.isHeldLocally());
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.SingleWriterLockLeaseTests" -x javadoc`
+Expected: Compilation error — `SingleWriterLockConfig`, `RenewResult`, `isDegraded()` etc. don't exist
+
+- [ ] **Step 3: Add lease tolerance settings to RemoteStoreSettings**
+
+Add to `RemoteStoreSettings.java`:
+
+```java
+public static final Setting<TimeValue> SINGLE_WRITER_LEASE_TOLERANCE = Setting.timeSetting(
+    "cluster.remote_store.single_writer.lease_tolerance",
+    TimeValue.timeValueSeconds(30),
+    TimeValue.timeValueSeconds(5),
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<Integer> SINGLE_WRITER_DEGRADE_AFTER_FAILURES = Setting.intSetting(
+    "cluster.remote_store.single_writer.degrade_after_failures", 2, 1, 10,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<TimeValue> SINGLE_WRITER_LOCK_ATTEMPT_TIMEOUT = Setting.timeSetting(
+    "cluster.remote_store.single_writer.lock_attempt_timeout",
+    TimeValue.timeValueSeconds(5),
+    TimeValue.timeValueSeconds(1),
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<Boolean> SINGLE_WRITER_FAST_DEGRADE = Setting.boolSetting(
+    "cluster.remote_store.single_writer.fast_degrade_on_first_failure", true,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+```
+
+- [ ] **Step 4: Create SingleWriterLockConfig**
+
+```java
+package org.elasticsearch.index.remote;
+
+public class SingleWriterLockConfig {
+
+    private final long leaseToleranceMs;
+    private final int degradeAfterFailures;
+    private final long lockAttemptTimeoutMs;
+    private final boolean fastDegradeOnFirstFailure;
+
+    public SingleWriterLockConfig(long leaseToleranceMs, int degradeAfterFailures,
+                                   long lockAttemptTimeoutMs, boolean fastDegradeOnFirstFailure) {
+        this.leaseToleranceMs = leaseToleranceMs;
+        this.degradeAfterFailures = degradeAfterFailures;
+        this.lockAttemptTimeoutMs = lockAttemptTimeoutMs;
+        this.fastDegradeOnFirstFailure = fastDegradeOnFirstFailure;
+    }
+
+    public long getLeaseToleranceMs() { return leaseToleranceMs; }
+    public int getDegradeAfterFailures() { return degradeAfterFailures; }
+    public long getLockAttemptTimeoutMs() { return lockAttemptTimeoutMs; }
+    public boolean isFastDegradeOnFirstFailure() { return fastDegradeOnFirstFailure; }
+}
+```
+
+- [ ] **Step 5: Enhance SingleWriterLock with lease tolerance and degraded mode**
+
+Add to `SingleWriterLock.java`:
+
+```java
+public enum RenewResult {
+    SUCCESS,
+    FAILED_TOLERABLE,   // within tolerance window, still held locally
+    DEGRADED,           // exceeded failure threshold, entering degraded mode
+    LEASE_EXPIRED       // tolerance window expired, lock no longer valid
+}
+
+private final SingleWriterLockConfig config;
+private volatile boolean degraded = false;
+private volatile boolean heldLocally = false;
+private volatile long lastSuccessfulRenewMs = 0;
+private int consecutiveFailures = 0;
+
+public SingleWriterLock(BlobContainer blobContainer, SingleWriterLockConfig config) {
+    this.blobContainer = blobContainer;
+    this.config = config;
+}
+
+public RenewResult tryRenew(long primaryTerm, String nodeId) {
+    try {
+        writeLock(primaryTerm, nodeId);
+        consecutiveFailures = 0;
+        lastSuccessfulRenewMs = System.currentTimeMillis();
+        degraded = false;
+        return RenewResult.SUCCESS;
+    } catch (IOException e) {
+        consecutiveFailures++;
+        long elapsed = System.currentTimeMillis() - lastSuccessfulRenewMs;
+
+        if (config.isFastDegradeOnFirstFailure() &&
+            consecutiveFailures >= config.getDegradeAfterFailures()) {
+            degraded = true;
+            logger.warn("SingleWriterLock degraded after {} consecutive failures, " +
+                "allowing local writes", consecutiveFailures);
+            return RenewResult.DEGRADED;
+        }
+
+        if (elapsed > config.getLeaseToleranceMs()) {
+            heldLocally = false;
+            logger.error("SingleWriterLock lease expired, tolerance={}ms elapsed={}ms",
+                config.getLeaseToleranceMs(), elapsed);
+            return RenewResult.LEASE_EXPIRED;
+        }
+
+        return RenewResult.FAILED_TOLERABLE;
+    }
+}
+
+public boolean isHeldLocally() { return heldLocally; }
+public boolean isDegraded() { return degraded; }
+public boolean allowWriteInDegradedMode() { return degraded && heldLocally; }
+```
+
+- [ ] **Step 6: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.SingleWriterLockLeaseTests" -x javadoc`
+Expected: All 4 tests PASS
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/SingleWriterLock.java \
+        server/src/main/java/org/elasticsearch/index/remote/SingleWriterLockConfig.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java \
+        server/src/test/java/org/elasticsearch/index/remote/SingleWriterLockLeaseTests.java
+git commit -m "feat(remote-store): add lease tolerance and fast degrade to SingleWriterLock
+
+Risk mitigation S-1: Remote Store unreachable no longer blocks writes indefinitely.
+Tolerance window (30s) + fast degrade (2 failures) reduces write interruption from 75-90s to 15-20s."
+```
+
+---
+
+## Task 14: Upload Order Guarantee (Translog Before Segment)
+
+> **Risk mitigation:** §8.9 Phase1 D-3 — Translog/Segment 上传顺序保证，防止 Recovery 时 segment 可见但 translog 缺失导致 seq_no gap
+
+**Files:**
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreRefreshListener.java`
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/SegmentUploadScheduler.java`
+- Create: `server/src/main/java/org/elasticsearch/index/remote/UploadOrderCoordinator.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/UploadOrderCoordinatorTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.test.ESTestCase;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+public class UploadOrderCoordinatorTests extends ESTestCase {
+
+    public void testSegmentUploadBlockedUntilTranslogUploaded() throws Exception {
+        List<String> uploadOrder = new ArrayList<>();
+        UploadOrderCoordinator coordinator = new UploadOrderCoordinator();
+
+        // Register a translog generation
+        coordinator.registerTranslogGeneration(5L);
+
+        // Attempt segment upload — should block
+        CountDownLatch segmentLatch = new CountDownLatch(1);
+        Thread segmentThread = new Thread(() -> {
+            coordinator.awaitTranslogUploadedForGeneration(5L);
+            uploadOrder.add("segment");
+            segmentLatch.countDown();
+        });
+        segmentThread.start();
+
+        // Brief pause — segment should still be blocked
+        assertFalse(segmentLatch.await(200, TimeUnit.MILLISECONDS));
+
+        // Complete translog upload
+        uploadOrder.add("translog");
+        coordinator.markTranslogUploaded(5L);
+
+        // Now segment should proceed
+        assertTrue(segmentLatch.await(5, TimeUnit.SECONDS));
+        assertEquals(List.of("translog", "segment"), uploadOrder);
+    }
+
+    public void testSegmentUploadProceedsIfNoTranslogPending() {
+        UploadOrderCoordinator coordinator = new UploadOrderCoordinator();
+        // No translog registered — segment upload should not block
+        coordinator.awaitTranslogUploadedForGeneration(5L); // should return immediately
+    }
+
+    public void testMultipleGenerationsOrderedCorrectly() throws Exception {
+        UploadOrderCoordinator coordinator = new UploadOrderCoordinator();
+        coordinator.registerTranslogGeneration(3L);
+        coordinator.registerTranslogGeneration(4L);
+
+        // Generation 4 segment waits for gen 4 translog
+        CountDownLatch latch = new CountDownLatch(1);
+        Thread t = new Thread(() -> {
+            coordinator.awaitTranslogUploadedForGeneration(4L);
+            latch.countDown();
+        });
+        t.start();
+
+        // Uploading gen 3 translog does not unblock gen 4 segment
+        coordinator.markTranslogUploaded(3L);
+        assertFalse(latch.await(200, TimeUnit.MILLISECONDS));
+
+        // Uploading gen 4 translog unblocks gen 4 segment
+        coordinator.markTranslogUploaded(4L);
+        assertTrue(latch.await(5, TimeUnit.SECONDS));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.UploadOrderCoordinatorTests" -x javadoc`
+Expected: Compilation error — `UploadOrderCoordinator` does not exist
+
+- [ ] **Step 3: Write implementation**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+public class UploadOrderCoordinator {
+
+    private static final Logger logger = LogManager.getLogger(UploadOrderCoordinator.class);
+    private static final long AWAIT_TIMEOUT_MS = 60_000;
+
+    private final ConcurrentHashMap<Long, CountDownLatch> pendingTranslogs = new ConcurrentHashMap<>();
+
+    public void registerTranslogGeneration(long generation) {
+        pendingTranslogs.putIfAbsent(generation, new CountDownLatch(1));
+    }
+
+    public void markTranslogUploaded(long generation) {
+        CountDownLatch latch = pendingTranslogs.remove(generation);
+        if (latch != null) {
+            latch.countDown();
+        }
+    }
+
+    public void awaitTranslogUploadedForGeneration(long generation) {
+        CountDownLatch latch = pendingTranslogs.get(generation);
+        if (latch == null) {
+            return; // no pending translog for this generation
+        }
+        try {
+            if (!latch.await(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                logger.warn("Timed out waiting for translog gen={} upload before segment upload", generation);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.warn("Interrupted waiting for translog gen={} upload", generation);
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.UploadOrderCoordinatorTests" -x javadoc`
+Expected: All 3 tests PASS
+
+- [ ] **Step 5: Wire into RefreshListener and TranslogManager**
+
+In `RemoteStoreRefreshListener.afterRefresh()`, before scheduling segment upload:
+```java
+// Ensure translog for this generation is uploaded first
+uploadOrderCoordinator.awaitTranslogUploadedForGeneration(currentGeneration);
+// Then proceed with segment upload
+segmentUploadScheduler.scheduleUpload(...);
+```
+
+In `RemoteTranslogTransferManager.onUploadComplete()`:
+```java
+// Signal that this generation's translog is uploaded
+uploadOrderCoordinator.markTranslogUploaded(generation);
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/UploadOrderCoordinator.java \
+        server/src/test/java/org/elasticsearch/index/remote/UploadOrderCoordinatorTests.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteStoreRefreshListener.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteTranslogTransferManager.java
+git commit -m "feat(remote-store): enforce translog-before-segment upload ordering
+
+Risk mitigation D-3: Guarantees translog is uploaded before corresponding segment,
+preventing seq_no gaps during Remote recovery."
+```
+
+---
+
+## Task 15: ForceUpload-Before-Handoff (Relocation Safety)
+
+> **Risk mitigation:** §7.3.3 — Relocation 前强制上传 tail，防止 Primary shard 迁移期间 Source 崩溃导致已 ACK 数据丢失
+
+**Files:**
+- Create: `server/src/main/java/org/elasticsearch/index/remote/RelocationUploadService.java`
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/RelocationUploadServiceTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.test.ESTestCase;
+
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+
+public class RelocationUploadServiceTests extends ESTestCase {
+
+    public void testForceUploadBlocksHandoffUntilComplete() throws Exception {
+        AtomicBoolean uploadComplete = new AtomicBoolean(false);
+        AtomicLong uploadedSeqNo = new AtomicLong(-1);
+
+        RelocationUploadService service = new RelocationUploadService(
+            60_000L,   // handoff_timeout: 60s
+            256 * 1024 * 1024L // max_tail_at_handoff: 256MB
+        );
+
+        // Simulate tail state: localCheckpoint=100, lastUploadedSeqNo=80
+        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
+
+        // Register upload callback
+        service.setForceUploadCallback((fromSeqNo) -> {
+            uploadedSeqNo.set(fromSeqNo);
+            uploadComplete.set(true);
+            return 100L; // returns new LUS after upload
+        });
+
+        // Execute force upload before handoff
+        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+
+        assertTrue(uploadComplete.get());
+        assertEquals(80L, uploadedSeqNo.get()); // should upload from LUS=80
+        assertEquals(RelocationUploadService.HandoffReadiness.READY, readiness);
+    }
+
+    public void testHandoffDelayedWhenTailExceedsMax() throws Exception {
+        RelocationUploadService service = new RelocationUploadService(
+            60_000L,
+            256 * 1024 * 1024L // 256MB max
+        );
+
+        // Tail is 500MB — exceeds max_tail_at_handoff
+        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(
+            100L, 80L, 500_000_000L);
+
+        service.setForceUploadCallback((fromSeqNo) -> {
+            // Simulates partial upload — only gets tail down to 300MB
+            return 90L;
+        });
+
+        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+        assertEquals(RelocationUploadService.HandoffReadiness.DELAYED, readiness);
+    }
+
+    public void testHandoffTimesOut() throws Exception {
+        RelocationUploadService service = new RelocationUploadService(
+            100L,  // very short timeout for test
+            256 * 1024 * 1024L
+        );
+
+        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
+
+        service.setForceUploadCallback((fromSeqNo) -> {
+            try {
+                Thread.sleep(200); // exceeds timeout
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return 100L;
+        });
+
+        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+        assertEquals(RelocationUploadService.HandoffReadiness.TIMEOUT, readiness);
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.RelocationUploadServiceTests" -x javadoc`
+Expected: Compilation error — `RelocationUploadService` does not exist
+
+- [ ] **Step 3: Write implementation**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.LongUnaryOperator;
+
+public class RelocationUploadService {
+
+    private static final Logger logger = LogManager.getLogger(RelocationUploadService.class);
+
+    private final long handoffTimeoutMs;
+    private final long maxTailAtHandoff;
+    private LongUnaryOperator forceUploadCallback;
+
+    public RelocationUploadService(long handoffTimeoutMs, long maxTailAtHandoff) {
+        this.handoffTimeoutMs = handoffTimeoutMs;
+        this.maxTailAtHandoff = maxTailAtHandoff;
+    }
+
+    public void setForceUploadCallback(LongUnaryOperator callback) {
+        this.forceUploadCallback = callback;
+    }
+
+    public HandoffReadiness prepareForHandoff(TailState tailState) {
+        if (forceUploadCallback == null) {
+            logger.warn("No force upload callback registered, handoff without upload");
+            return HandoffReadiness.READY;
+        }
+
+        long tailBytes = tailState.tailSizeBytes;
+        logger.info("Preparing for handoff: LUS={}, localCP={}, tailBytes={}",
+            tailState.lastUploadedSeqNo, tailState.localCheckpoint, tailBytes);
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Long> future = executor.submit(() -> forceUploadCallback.applyAsLong(tailState.lastUploadedSeqNo));
+            long newLUS = future.get(handoffTimeoutMs, TimeUnit.MILLISECONDS);
+
+            // Check if tail is now within acceptable range
+            long remainingTail = tailState.localCheckpoint - newLUS;
+            if (remainingTail > 0 && tailBytes > maxTailAtHandoff) {
+                logger.warn("Tail still exceeds max after upload: remaining_seqno_gap={}", remainingTail);
+                return HandoffReadiness.DELAYED;
+            }
+
+            logger.info("Force upload complete: newLUS={}, ready for handoff", newLUS);
+            return HandoffReadiness.READY;
+        } catch (TimeoutException e) {
+            logger.error("Force upload timed out after {}ms", handoffTimeoutMs);
+            return HandoffReadiness.TIMEOUT;
+        } catch (Exception e) {
+            logger.error("Force upload failed", e);
+            return HandoffReadiness.FAILED;
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    public enum HandoffReadiness {
+        READY,    // tail uploaded, safe to proceed
+        DELAYED,  // tail still too large, retry later
+        TIMEOUT,  // upload timed out
+        FAILED    // upload failed
+    }
+
+    public static class TailState {
+        final long localCheckpoint;
+        final long lastUploadedSeqNo;
+        final long tailSizeBytes;
+
+        public TailState(long localCheckpoint, long lastUploadedSeqNo, long tailSizeBytes) {
+            this.localCheckpoint = localCheckpoint;
+            this.lastUploadedSeqNo = lastUploadedSeqNo;
+            this.tailSizeBytes = tailSizeBytes;
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Add relocation settings to RemoteStoreSettings**
+
+```java
+public static final Setting<Boolean> RELOCATION_FORCE_UPLOAD = Setting.boolSetting(
+    "cluster.routing.allocation.relocation.force_upload_before_handoff", true,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<TimeValue> RELOCATION_HANDOFF_TIMEOUT = Setting.timeSetting(
+    "index.remote_store.relocation.handoff_timeout",
+    TimeValue.timeValueSeconds(60),
+    TimeValue.timeValueSeconds(10),
+    Setting.Property.IndexScope, Setting.Property.Dynamic);
+
+public static final Setting<ByteSizeValue> RELOCATION_MAX_TAIL_AT_HANDOFF = Setting.byteSizeSetting(
+    "index.remote_store.relocation.max_tail_at_handoff",
+    new ByteSizeValue(256, ByteSizeUnit.MB),
+    Setting.Property.IndexScope, Setting.Property.Dynamic);
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.RelocationUploadServiceTests" -x javadoc`
+Expected: All 3 tests PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/RelocationUploadService.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java \
+        server/src/test/java/org/elasticsearch/index/remote/RelocationUploadServiceTests.java
+git commit -m "feat(remote-store): add ForceUpload-Before-Handoff for relocation safety
+
+Risk mitigation §7.3.3: Primary shard relocation now forces tail upload to Remote
+before handoff. If Source crashes during handoff, Target can recover from Remote.
+Reduces data loss window from full tail size to ≤1 refresh period (1s)."
+```
+
+---
+
+## Task 16: Coordinator Fast Failover Routing
+
+> **Risk mitigation:** §8.10.6(改进3) — Coordinator 收到 node-left 事件后立即跳过该节点路由，读取中断从 30s 降至 2-5s
+
+**Files:**
+- Create: `server/src/main/java/org/elasticsearch/index/remote/FastFailoverService.java`
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/FastFailoverServiceTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.cluster.node.DiscoveryNode;
+import org.elasticsearch.test.ESTestCase;
+
+import java.util.Collections;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public class FastFailoverServiceTests extends ESTestCase {
+
+    public void testNodeMarkedUnavailableOnNodeLeft() {
+        FastFailoverService service = new FastFailoverService(true, 2000L);
+        String nodeId = "node-1";
+
+        assertFalse(service.isNodeUnavailable(nodeId));
+
+        service.onNodeLeft(nodeId);
+
+        assertTrue(service.isNodeUnavailable(nodeId));
+    }
+
+    public void testNodeClearedWhenRejoins() {
+        FastFailoverService service = new FastFailoverService(true, 2000L);
+        String nodeId = "node-1";
+
+        service.onNodeLeft(nodeId);
+        assertTrue(service.isNodeUnavailable(nodeId));
+
+        service.onNodeJoined(nodeId);
+        assertFalse(service.isNodeUnavailable(nodeId));
+    }
+
+    public void testDisabledServiceAlwaysAvailable() {
+        FastFailoverService service = new FastFailoverService(false, 2000L);
+        String nodeId = "node-1";
+
+        service.onNodeLeft(nodeId);
+        assertFalse(service.isNodeUnavailable(nodeId)); // disabled → never marks unavailable
+    }
+
+    public void testShouldSkipNodeForRouting() {
+        FastFailoverService service = new FastFailoverService(true, 2000L);
+        String deadNode = "node-1";
+        String aliveNode = "node-2";
+
+        service.onNodeLeft(deadNode);
+
+        assertTrue(service.shouldSkipNode(deadNode));
+        assertFalse(service.shouldSkipNode(aliveNode));
+    }
+
+    public void testGetReducedTimeoutForKnownDeadNode() {
+        FastFailoverService service = new FastFailoverService(true, 2000L);
+        String deadNode = "node-1";
+
+        // Not marked dead — should return default
+        assertEquals(-1L, service.getReducedTimeout(deadNode));
+
+        service.onNodeLeft(deadNode);
+        assertEquals(2000L, service.getReducedTimeout(deadNode));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.FastFailoverServiceTests" -x javadoc`
+Expected: Compilation error
+
+- [ ] **Step 3: Write implementation**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class FastFailoverService {
+
+    private static final Logger logger = LogManager.getLogger(FastFailoverService.class);
+
+    private final boolean enabled;
+    private final long knownDeadTimeoutMs;
+    private final Set<String> unavailableNodes = ConcurrentHashMap.newKeySet();
+
+    public FastFailoverService(boolean enabled, long knownDeadTimeoutMs) {
+        this.enabled = enabled;
+        this.knownDeadTimeoutMs = knownDeadTimeoutMs;
+    }
+
+    public void onNodeLeft(String nodeId) {
+        if (enabled) {
+            unavailableNodes.add(nodeId);
+            logger.info("Node [{}] marked unavailable for fast failover routing", nodeId);
+        }
+    }
+
+    public void onNodeJoined(String nodeId) {
+        if (unavailableNodes.remove(nodeId)) {
+            logger.info("Node [{}] rejoined, cleared from unavailable set", nodeId);
+        }
+    }
+
+    public boolean isNodeUnavailable(String nodeId) {
+        return unavailableNodes.contains(nodeId);
+    }
+
+    public boolean shouldSkipNode(String nodeId) {
+        return enabled && unavailableNodes.contains(nodeId);
+    }
+
+    public long getReducedTimeout(String nodeId) {
+        if (enabled && unavailableNodes.contains(nodeId)) {
+            return knownDeadTimeoutMs;
+        }
+        return -1L; // use default timeout
+    }
+}
+```
+
+- [ ] **Step 4: Add fast failover settings**
+
+Add to `RemoteStoreSettings.java`:
+
+```java
+public static final Setting<Boolean> FAST_FAILOVER_ENABLED = Setting.boolSetting(
+    "cluster.search.fast_failover.enabled", true,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<TimeValue> FAST_FAILOVER_KNOWN_DEAD_TIMEOUT = Setting.timeSetting(
+    "cluster.search.fast_failover.known_dead_timeout",
+    TimeValue.timeValueSeconds(2),
+    TimeValue.timeValueMillis(500),
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.FastFailoverServiceTests" -x javadoc`
+Expected: All 5 tests PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/FastFailoverService.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java \
+        server/src/test/java/org/elasticsearch/index/remote/FastFailoverServiceTests.java
+git commit -m "feat(remote-store): add FastFailoverService for coordinator routing
+
+Risk mitigation §8.10.6: Coordinator immediately marks nodes as unavailable on
+node-left events, skipping them for routing instead of waiting for 30s transport
+timeout. Reduces read interruption from 30s to 2-5s."
+```
+
+---
+
+## Task 17: Concurrent Primary Promotion Support
+
+> **Risk mitigation:** §8.10.6(改进1) — 并发 Primary 提升，热点节点崩溃时 100 个 shard 恢复从 500s 降至 50s
+
+**Files:**
+- Create: `server/src/main/java/org/elasticsearch/index/remote/PrimaryPromotionConfig.java`
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/PrimaryPromotionConfigTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.test.ESTestCase;
+
+public class PrimaryPromotionConfigTests extends ESTestCase {
+
+    public void testDefaultConcurrency() {
+        Settings settings = Settings.EMPTY;
+        assertEquals(20, RemoteStoreSettings.PRIMARY_PROMOTION_CONCURRENT.get(settings).intValue());
+    }
+
+    public void testCustomConcurrency() {
+        Settings settings = Settings.builder()
+            .put("cluster.routing.allocation.primary_promotion.concurrent", 10)
+            .build();
+        assertEquals(10, RemoteStoreSettings.PRIMARY_PROMOTION_CONCURRENT.get(settings).intValue());
+    }
+
+    public void testPreselectEnabled() {
+        Settings settings = Settings.builder()
+            .put("cluster.routing.allocation.primary_promotion.preselect", true)
+            .build();
+        assertTrue(RemoteStoreSettings.PRIMARY_PROMOTION_PRESELECT.get(settings));
+    }
+
+    public void testPrimaryShardsPerNodeLimit() {
+        Settings settings = Settings.builder()
+            .put("cluster.routing.allocation.primary_shards_per_node", 30)
+            .build();
+        assertEquals(30, RemoteStoreSettings.PRIMARY_SHARDS_PER_NODE.get(settings).intValue());
+    }
+
+    public void testPrimaryPromotionConfigObject() {
+        PrimaryPromotionConfig config = new PrimaryPromotionConfig(20, 1000L, true);
+        assertEquals(20, config.getConcurrent());
+        assertEquals(1000L, config.getBatchIntervalMs());
+        assertTrue(config.isPreselectEnabled());
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.PrimaryPromotionConfigTests" -x javadoc`
+Expected: Compilation error
+
+- [ ] **Step 3: Add settings**
+
+Add to `RemoteStoreSettings.java`:
+
+```java
+public static final Setting<Integer> PRIMARY_PROMOTION_CONCURRENT = Setting.intSetting(
+    "cluster.routing.allocation.primary_promotion.concurrent", 20, 1, 100,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<TimeValue> PRIMARY_PROMOTION_BATCH_INTERVAL = Setting.timeSetting(
+    "cluster.routing.allocation.primary_promotion.batch_interval",
+    TimeValue.timeValueSeconds(1),
+    TimeValue.timeValueMillis(100),
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<Boolean> PRIMARY_PROMOTION_PRESELECT = Setting.boolSetting(
+    "cluster.routing.allocation.primary_promotion.preselect", true,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+
+public static final Setting<Integer> PRIMARY_SHARDS_PER_NODE = Setting.intSetting(
+    "cluster.routing.allocation.primary_shards_per_node", 20, -1, 1000,
+    Setting.Property.NodeScope, Setting.Property.Dynamic);
+```
+
+- [ ] **Step 4: Write PrimaryPromotionConfig**
+
+```java
+package org.elasticsearch.index.remote;
+
+public class PrimaryPromotionConfig {
+
+    private final int concurrent;
+    private final long batchIntervalMs;
+    private final boolean preselectEnabled;
+
+    public PrimaryPromotionConfig(int concurrent, long batchIntervalMs, boolean preselectEnabled) {
+        this.concurrent = concurrent;
+        this.batchIntervalMs = batchIntervalMs;
+        this.preselectEnabled = preselectEnabled;
+    }
+
+    public int getConcurrent() { return concurrent; }
+    public long getBatchIntervalMs() { return batchIntervalMs; }
+    public boolean isPreselectEnabled() { return preselectEnabled; }
+}
+```
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.PrimaryPromotionConfigTests" -x javadoc`
+Expected: All 5 tests PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/PrimaryPromotionConfig.java \
+        server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java \
+        server/src/test/java/org/elasticsearch/index/remote/PrimaryPromotionConfigTests.java
+git commit -m "feat(remote-store): add concurrent primary promotion config and shard limits
+
+Risk mitigation §8.10.6: Defines concurrency (20 parallel) for primary promotion
+and primary_shards_per_node limit (20) to prevent hot-spot node failure from
+causing minutes-long write outage. 100 shards: 500s → ~50s recovery."
+```
+
+---
+
+## Task 18: Cross-AZ Replica Distribution Enforcement
+
+> **Risk mitigation:** §8.7.2(D-2) — 强制跨 AZ 副本分布，防止单 AZ 故障时 Primary + Sync Replica 同时丢失
+
+**Files:**
+- Modify: `server/src/main/java/org/elasticsearch/index/remote/RemoteStoreSettings.java`
+- Create: `server/src/main/java/org/elasticsearch/index/remote/CrossAzAllocationEnforcer.java`
+- Test: `server/src/test/java/org/elasticsearch/index/remote/CrossAzAllocationEnforcerTests.java`
+
+- [ ] **Step 1: Write the failing test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.test.ESTestCase;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class CrossAzAllocationEnforcerTests extends ESTestCase {
+
+    public void testPrimaryAndReplicaMustBeInDifferentAz() {
+        List<String> azValues = Arrays.asList("az-1", "az-2", "az-3");
+        CrossAzAllocationEnforcer enforcer = new CrossAzAllocationEnforcer(azValues, "zone");
+
+        // Primary in az-1
+        Map<String, String> primaryNodeAttrs = new HashMap<>();
+        primaryNodeAttrs.put("zone", "az-1");
+
+        // Candidate replica in az-1 (same as primary) — should be rejected
+        Map<String, String> replicaNodeAttrs1 = new HashMap<>();
+        replicaNodeAttrs1.put("zone", "az-1");
+        assertFalse(enforcer.canAllocateReplicaOnNode(primaryNodeAttrs, replicaNodeAttrs1));
+
+        // Candidate replica in az-2 (different) — should be allowed
+        Map<String, String> replicaNodeAttrs2 = new HashMap<>();
+        replicaNodeAttrs2.put("zone", "az-2");
+        assertTrue(enforcer.canAllocateReplicaOnNode(primaryNodeAttrs, replicaNodeAttrs2));
+    }
+
+    public void testValidationPassesForCrossAzSetup() {
+        List<String> azValues = Arrays.asList("az-1", "az-2", "az-3");
+        CrossAzAllocationEnforcer enforcer = new CrossAzAllocationEnforcer(azValues, "zone");
+
+        Map<String, String> allocationMap = new HashMap<>();
+        allocationMap.put("primary", "az-1");
+        allocationMap.put("replica-0", "az-2");
+
+        assertTrue(enforcer.validateShardDistribution(allocationMap));
+    }
+
+    public void testValidationFailsForSameAzSetup() {
+        List<String> azValues = Arrays.asList("az-1", "az-2", "az-3");
+        CrossAzAllocationEnforcer enforcer = new CrossAzAllocationEnforcer(azValues, "zone");
+
+        Map<String, String> allocationMap = new HashMap<>();
+        allocationMap.put("primary", "az-1");
+        allocationMap.put("replica-0", "az-1"); // same AZ
+
+        assertFalse(enforcer.validateShardDistribution(allocationMap));
+    }
+
+    public void testDisabledEnforcerAlwaysAllows() {
+        CrossAzAllocationEnforcer enforcer = CrossAzAllocationEnforcer.DISABLED;
+
+        Map<String, String> primaryAttrs = new HashMap<>();
+        primaryAttrs.put("zone", "az-1");
+        Map<String, String> replicaAttrs = new HashMap<>();
+        replicaAttrs.put("zone", "az-1");
+
+        assertTrue(enforcer.canAllocateReplicaOnNode(primaryAttrs, replicaAttrs));
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.CrossAzAllocationEnforcerTests" -x javadoc`
+Expected: Compilation error
+
+- [ ] **Step 3: Write implementation**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+
+public class CrossAzAllocationEnforcer {
+
+    private static final Logger logger = LogManager.getLogger(CrossAzAllocationEnforcer.class);
+
+    public static final CrossAzAllocationEnforcer DISABLED = new CrossAzAllocationEnforcer(
+        Collections.emptyList(), "");
+
+    private final List<String> azValues;
+    private final String awarenessAttribute;
+
+    public CrossAzAllocationEnforcer(List<String> azValues, String awarenessAttribute) {
+        this.azValues = azValues;
+        this.awarenessAttribute = awarenessAttribute;
+    }
+
+    public boolean canAllocateReplicaOnNode(Map<String, String> primaryNodeAttrs,
+                                             Map<String, String> candidateNodeAttrs) {
+        if (azValues.isEmpty() || awarenessAttribute.isEmpty()) {
+            return true; // enforcement disabled
+        }
+
+        String primaryAz = primaryNodeAttrs.get(awarenessAttribute);
+        String candidateAz = candidateNodeAttrs.get(awarenessAttribute);
+
+        if (primaryAz == null || candidateAz == null) {
+            logger.warn("Awareness attribute [{}] missing on node, allowing allocation", awarenessAttribute);
+            return true;
+        }
+
+        boolean allowed = !Objects.equals(primaryAz, candidateAz);
+        if (!allowed) {
+            logger.debug("Rejecting replica allocation: primary and replica both in AZ [{}]", primaryAz);
+        }
+        return allowed;
+    }
+
+    public boolean validateShardDistribution(Map<String, String> shardToAzMap) {
+        if (azValues.isEmpty()) {
+            return true;
+        }
+
+        String primaryAz = shardToAzMap.get("primary");
+        if (primaryAz == null) {
+            return true;
+        }
+
+        for (Map.Entry<String, String> entry : shardToAzMap.entrySet()) {
+            if (entry.getKey().startsWith("replica") && Objects.equals(primaryAz, entry.getValue())) {
+                logger.warn("Shard distribution violation: primary and {} in same AZ [{}]",
+                    entry.getKey(), primaryAz);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.CrossAzAllocationEnforcerTests" -x javadoc`
+Expected: All 4 tests PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add server/src/main/java/org/elasticsearch/index/remote/CrossAzAllocationEnforcer.java \
+        server/src/test/java/org/elasticsearch/index/remote/CrossAzAllocationEnforcerTests.java
+git commit -m "feat(remote-store): add CrossAzAllocationEnforcer for replica distribution
+
+Risk mitigation D-2: Enforces Primary and Sync Replica in different AZs.
+Single-AZ failure no longer causes both to be lost simultaneously,
+guaranteeing RPO<5s as documented in SLO."
+```
+
+---
+
+## Task 19: Risk Mitigation Integration Test
+
+> Verifies all Phase 1 risk mitigations work together in a realistic scenario
+
+**Files:**
+- Create: `server/src/internalClusterTest/java/org/elasticsearch/index/remote/RemoteStoreRiskMitigationIT.java`
+
+- [ ] **Step 1: Write integration test**
+
+```java
+package org.elasticsearch.index.remote;
+
+import org.elasticsearch.action.index.IndexResponse;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.test.ESIntegTestCase;
+
+import static org.hamcrest.Matchers.equalTo;
+
+@ESIntegTestCase.ClusterScope(numDataNodes = 3)
+public class RemoteStoreRiskMitigationIT extends ESIntegTestCase {
+
+    @Override
+    protected Settings nodeSettings(int nodeOrdinal) {
+        return Settings.builder()
+            .put(super.nodeSettings(nodeOrdinal))
+            .put("cluster.remote_store.single_writer.fast_degrade_on_first_failure", true)
+            .put("cluster.remote_store.single_writer.degrade_after_failures", 2)
+            .put("cluster.search.fast_failover.enabled", true)
+            .put("cluster.routing.allocation.primary_promotion.concurrent", 20)
+            .put("cluster.routing.allocation.primary_shards_per_node", 20)
+            .build();
+    }
+
+    public void testSingleWriterLockSettingsRegistered() {
+        ClusterState state = client().admin().cluster().prepareState().get().getState();
+        assertNotNull(state);
+        // Verify settings are registered and queryable
+        Settings persistentSettings = state.metadata().persistentSettings();
+        assertNotNull(persistentSettings);
+    }
+
+    public void testFastFailoverSettingsRegistered() {
+        Settings settings = client().admin().cluster().prepareState().get()
+            .getState().metadata().persistentSettings();
+        // Just verify no exception — settings are registered
+        assertNotNull(settings);
+    }
+
+    public void testUploadOrderCoordinatorDoesNotBlockWhenNoTranslog() {
+        UploadOrderCoordinator coordinator = new UploadOrderCoordinator();
+        // Should not block even without prior registration
+        coordinator.awaitTranslogUploadedForGeneration(1L);
+    }
+
+    public void testRelocationUploadServiceReady() {
+        RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L);
+        service.setForceUploadCallback(seqNo -> seqNo + 10);
+        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 90L, 1024L);
+        RelocationUploadService.HandoffReadiness result = service.prepareForHandoff(tailState);
+        assertThat(result, equalTo(RelocationUploadService.HandoffReadiness.READY));
+    }
+}
+```
+
+- [ ] **Step 2: Run integration test**
+
+Run: `./gradlew :server:internalClusterTest --tests "org.elasticsearch.index.remote.RemoteStoreRiskMitigationIT" -x javadoc`
+Expected: All tests PASS
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add server/src/internalClusterTest/java/org/elasticsearch/index/remote/RemoteStoreRiskMitigationIT.java
+git commit -m "test(remote-store): add integration tests for Phase 1 risk mitigations"
+```
+
+---
+
+## Task 20: Final Phase 1 Validation
+
+- [ ] **Step 1: Full compilation check (including risk mitigation code)**
+
+Run: `./gradlew :server:compileJava :server:compileTestJava`
+Expected: BUILD SUCCESSFUL
+
+- [ ] **Step 2: Run ALL remote store tests**
+
+Run: `./gradlew :server:test --tests "org.elasticsearch.index.remote.*" -x javadoc`
+Expected: All tests PASS (original Tasks 1-11 + risk mitigation Tasks 13-18)
+
+- [ ] **Step 3: Verify no regressions**
+
+Run: `./gradlew :server:test -x javadoc`
+Expected: No new failures
+
+- [ ] **Step 4: Final commit**
+
+```bash
+git commit --allow-empty -m "chore(remote-store): Phase 1 complete — core write-back + risk mitigations
+
+Includes:
+- Remote Store write-back (segment + translog async upload)
+- SingleWriterLock with lease tolerance and fast degrade
+- Upload order guarantee (translog before segment)
+- ForceUpload-Before-Handoff for relocation safety
+- FastFailoverService for coordinator routing
+- Concurrent primary promotion config
+- Cross-AZ replica distribution enforcement"
 ```
 
 ---
@@ -1865,8 +3098,8 @@ git commit --allow-empty -m "chore(remote-store): Phase 1 Remote Store write-bac
 
 This plan covers Phase 1 only. The remaining phases require separate plans:
 
-- **Phase 2 Plan**: FileCache (SharedBlobCache + SparseFileTracker), LayeredDirectory, LeanSyncReplicaEngine, TieringService state machine
-- **Phase 3 Plan**: AutoscalingService, 6 Deciders, K8s HPA/ECK integration, PromotionRegistry
-- **Phase 4 Plan**: CCR enhancement, PITR, PrefetchService, OpenTelemetry, Chaos Mesh
+- **Phase 2 Plan**: FileCache (SharedBlobCache + SparseFileTracker), LayeredDirectory, LeanSyncReplicaEngine, TieringService state machine + risk mitigations (D-1 LSR tail drop delay, P-3 merge routing, A-1 warm bandwidth quota)
+- **Phase 3 Plan**: AutoscalingService, 6 Deciders, K8s HPA/ECK integration, PromotionRegistry + risk mitigations (A-2 Master offload, S-3 Tiering-Autoscaler interlock)
+- **Phase 4 Plan**: CCR enhancement, PITR, PrefetchService, OpenTelemetry, Chaos Mesh + risk mitigations (S-1 dual-mode lock, S-5 S3 prefix, O-2 metadata versioning)
 
 Each plan will be created when its predecessor phase reaches GA validation.

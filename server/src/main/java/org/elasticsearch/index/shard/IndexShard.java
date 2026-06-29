@@ -91,6 +91,11 @@ import org.elasticsearch.index.engine.EngineException;
 import org.elasticsearch.index.engine.EngineFactory;
 import org.elasticsearch.index.engine.ReadOnlyEngine;
 import org.elasticsearch.index.engine.RefreshFailedEngineException;
+import org.elasticsearch.index.remote.RemoteSegmentStoreDirectory;
+import org.elasticsearch.index.remote.RemoteStoreRefreshListener;
+import org.elasticsearch.index.remote.RemoteStoreSettings;
+import org.elasticsearch.index.remote.RemoteStoreStats;
+import org.elasticsearch.index.remote.SegmentUploadScheduler;
 import org.elasticsearch.index.engine.SafeCommitInfo;
 import org.elasticsearch.index.engine.Segment;
 import org.elasticsearch.index.engine.SegmentsStats;
@@ -292,6 +297,12 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private volatile boolean useRetentionLeasesInPeerRecovery;
     private final boolean isDataStreamIndex; // if a shard is a part of data stream
 
+    // Remote store fields
+    private final boolean remoteStoreEnabled;
+    private volatile RemoteStoreRefreshListener remoteStoreRefreshListener;
+    private volatile SegmentUploadScheduler segmentUploadScheduler;
+    private volatile RemoteStoreStats remoteStoreStats;
+
     public IndexShard(
         final ShardRouting shardRouting,
         final IndexSettings indexSettings,
@@ -399,6 +410,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.useRetentionLeasesInPeerRecovery = replicationTracker.hasAllPeerRecoveryRetentionLeases();
         this.refreshPendingLocationListener = new RefreshPendingLocationListener();
         this.isDataStreamIndex = mapperService == null ? false : mapperService.mappingLookup().isDataStreamTimestampFieldEnabled();
+        this.remoteStoreEnabled = RemoteStoreSettings.REMOTE_STORE_ENABLED.get(indexSettings.getSettings());
     }
 
     public ThreadPool getThreadPool() {
@@ -407,6 +419,26 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
     public Store store() {
         return this.store;
+    }
+
+    public boolean isRemoteStoreEnabled() {
+        return remoteStoreEnabled;
+    }
+
+    public void startRemoteStore(RemoteSegmentStoreDirectory remoteDirectory, int parallelism, long maxBytesInFlight) {
+        if (!remoteStoreEnabled) {
+            return;
+        }
+        this.remoteStoreStats = new RemoteStoreStats();
+        this.segmentUploadScheduler = new SegmentUploadScheduler(remoteDirectory, threadPool, parallelism, maxBytesInFlight);
+        if (this.remoteStoreRefreshListener != null) {
+            this.remoteStoreRefreshListener.activate(remoteDirectory, segmentUploadScheduler, getOperationPrimaryTerm());
+            logger.info("[{}] Remote store activated", shardId);
+        }
+    }
+
+    public RemoteStoreStats getRemoteStoreStats() {
+        return remoteStoreStats;
     }
 
     /**
@@ -1718,6 +1750,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
                     // playing safe here and close the engine even if the above succeeds - close can be called multiple times
                     // Also closing refreshListeners to prevent us from accumulating any more listeners
                     IOUtils.close(engine, globalCheckpointListeners, refreshListeners, pendingReplicationActions);
+                    if (segmentUploadScheduler != null) {
+                        segmentUploadScheduler.close();
+                    }
                     indexShardOperationPermits.close();
                 }
             }
@@ -3357,6 +3392,13 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             }
         };
         final boolean isTimeseriesIndex = mapperService == null ? false : mapperService.mappingLookup().hasTimestampField();
+        final List<ReferenceManager.RefreshListener> externalListeners;
+        if (remoteStoreEnabled) {
+            this.remoteStoreRefreshListener = new RemoteStoreRefreshListener(shardId, store, store.directory());
+            externalListeners = Arrays.asList(refreshListeners, refreshPendingLocationListener, remoteStoreRefreshListener);
+        } else {
+            externalListeners = Arrays.asList(refreshListeners, refreshPendingLocationListener);
+        }
         return new EngineConfig(
             shardId,
             threadPool,
@@ -3372,7 +3414,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             cachingPolicy,
             translogConfig,
             IndexingMemoryController.SHARD_INACTIVE_TIME_SETTING.get(indexSettings.getSettings()),
-            Arrays.asList(refreshListeners, refreshPendingLocationListener),
+            externalListeners,
             Collections.singletonList(new RefreshMetricUpdater(refreshMetric)),
             indexSort,
             circuitBreakerService,
