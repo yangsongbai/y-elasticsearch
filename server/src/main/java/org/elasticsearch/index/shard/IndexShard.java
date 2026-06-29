@@ -432,7 +432,7 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         this.remoteStoreStats = new RemoteStoreStats();
         this.segmentUploadScheduler = new SegmentUploadScheduler(remoteDirectory, threadPool, parallelism, maxBytesInFlight);
         if (this.remoteStoreRefreshListener != null) {
-            this.remoteStoreRefreshListener.activate(remoteDirectory, segmentUploadScheduler, getOperationPrimaryTerm());
+            this.remoteStoreRefreshListener.activate(remoteDirectory, segmentUploadScheduler, getOperationPrimaryTerm(), threadPool);
             logger.info("[{}] Remote store activated", shardId);
         }
     }

@@ -13,12 +13,12 @@ public class RestGetAutoscalingCapacityAction extends BaseRestHandler {
 
     @Override
     public String getName() {
-        return "get_autoscaling_capacity";
+        return "get_remote_store_autoscaling_capacity";
     }
 
     @Override
     public List<Route> routes() {
-        return Arrays.asList(new Route(RestRequest.Method.GET, "/_autoscaling/capacity"));
+        return Arrays.asList(new Route(RestRequest.Method.GET, "/_remote_store/autoscaling/capacity"));
     }
 
     @Override

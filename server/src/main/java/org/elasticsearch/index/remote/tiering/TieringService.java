@@ -10,6 +10,8 @@ package org.elasticsearch.index.remote.tiering;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.index.remote.VersionGatekeeper;
 
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,9 +39,32 @@ public class TieringService {
      * @param index the index name
      * @param currentState the current tier state
      * @param targetState the desired target tier state
+     * @param clusterState the current cluster state (for version gating)
      * @return true if the transition completed successfully, false otherwise
      */
-    public boolean transitionIndex(String index, TieringState currentState, TieringState targetState) {
+    public boolean transitionIndex(String index, TieringState currentState, TieringState targetState,
+                                   ClusterState clusterState) {
+        if (!VersionGatekeeper.allNodesSupport(clusterState)) {
+            logger.warn("Cannot transition index [{}]: cluster has nodes below version [{}]",
+                index, VersionGatekeeper.REMOTE_STORE_MIN_VERSION);
+            return false;
+        }
+
+        TieringMetadata existing = indexStates.get(index);
+        if (existing != null && existing.hasUnknownState()) {
+            logger.warn("Cannot transition index [{}]: stored state was deserialized from an unknown value. " +
+                "Upgrade all nodes to resolve.", index);
+            return false;
+        }
+
+        if (isPromoteTransition(currentState, targetState)) {
+            if (!currentState.canTransitionTo(targetState)) {
+                logger.warn("Invalid promote transition from {} to {} for index [{}]", currentState, targetState, index);
+                return false;
+            }
+            return executeDirectTransition(index, currentState, targetState);
+        }
+
         TieringState intermediate = getIntermediateState(currentState, targetState);
         if (intermediate == null) {
             logger.warn("Invalid transition from {} to {} for index [{}]", currentState, targetState, index);
@@ -69,18 +94,34 @@ public class TieringService {
         return true;
     }
 
+    private boolean isPromoteTransition(TieringState from, TieringState to) {
+        return (from == TieringState.WARM && to == TieringState.HOT)
+            || (from == TieringState.COLD && to == TieringState.WARM);
+    }
+
+    private boolean executeDirectTransition(String index, TieringState currentState, TieringState targetState) {
+        if (!transitioner.prepareTransition(index, currentState, targetState)) {
+            logger.warn("Prepare failed for index [{}] promote {} -> {}", index, currentState, targetState);
+            return false;
+        }
+
+        if (!transitioner.executeTransition(index, currentState, targetState)) {
+            logger.warn("Execute failed for index [{}] promote, rolling back", index);
+            transitioner.rollback(index, targetState, currentState);
+            indexStates.put(index, new TieringMetadata(currentState, targetState, System.currentTimeMillis()));
+            return false;
+        }
+
+        indexStates.put(index, new TieringMetadata(targetState, currentState, System.currentTimeMillis()));
+        return true;
+    }
+
     private TieringState getIntermediateState(TieringState from, TieringState to) {
         if (from == TieringState.HOT && to == TieringState.WARM) {
             return TieringState.HOT_TO_WARM;
         }
         if (from == TieringState.WARM && to == TieringState.COLD) {
             return TieringState.WARM_TO_COLD;
-        }
-        if (from == TieringState.WARM && to == TieringState.HOT) {
-            return TieringState.HOT;
-        }
-        if (from == TieringState.COLD && to == TieringState.WARM) {
-            return TieringState.WARM;
         }
         return null;
     }

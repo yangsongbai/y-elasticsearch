@@ -14,12 +14,20 @@ import java.util.Map;
 
 public class RemoteSegmentMetadata {
 
+    public static final int CURRENT_VERSION = 1;
+
+    private final int version;
     private final long primaryTerm;
     private final long generation;
     private final long checkpoint;
     private final Map<String, FileInfo> files;
 
     public RemoteSegmentMetadata(long primaryTerm, long generation, long checkpoint, Map<String, FileInfo> files) {
+        this(CURRENT_VERSION, primaryTerm, generation, checkpoint, files);
+    }
+
+    public RemoteSegmentMetadata(int version, long primaryTerm, long generation, long checkpoint, Map<String, FileInfo> files) {
+        this.version = version;
         this.primaryTerm = primaryTerm;
         this.generation = generation;
         this.checkpoint = checkpoint;
@@ -32,6 +40,10 @@ public class RemoteSegmentMetadata {
 
     public long generation() {
         return generation;
+    }
+
+    public int version() {
+        return version;
     }
 
     public long checkpoint() {
@@ -58,6 +70,7 @@ public class RemoteSegmentMetadata {
     public BytesReference toXContent() throws IOException {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
+            builder.field("version", version);
             builder.field("primary_term", primaryTerm);
             builder.field("generation", generation);
             builder.field("checkpoint", checkpoint);
@@ -79,6 +92,7 @@ public class RemoteSegmentMetadata {
                 .createParser(NamedXContentRegistry.EMPTY, DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                     BytesReference.toBytes(bytes))) {
             parser.nextToken();
+            int version = 0;
             long primaryTerm = 0;
             long generation = 0;
             long checkpoint = 0;
@@ -86,7 +100,9 @@ public class RemoteSegmentMetadata {
             while (parser.nextToken() != XContentParser.Token.END_OBJECT) {
                 String field = parser.currentName();
                 parser.nextToken();
-                if ("primary_term".equals(field)) {
+                if ("version".equals(field)) {
+                    version = parser.intValue();
+                } else if ("primary_term".equals(field)) {
                     primaryTerm = parser.longValue();
                 } else if ("generation".equals(field)) {
                     generation = parser.longValue();
@@ -105,13 +121,17 @@ public class RemoteSegmentMetadata {
                                 size = parser.longValue();
                             } else if ("checksum".equals(f)) {
                                 checksum = parser.text();
+                            } else {
+                                parser.skipChildren();
                             }
                         }
                         files.put(fileName, new FileInfo(size, checksum));
                     }
+                } else {
+                    parser.skipChildren();
                 }
             }
-            return new RemoteSegmentMetadata(primaryTerm, generation, checkpoint, files);
+            return new RemoteSegmentMetadata(version, primaryTerm, generation, checkpoint, files);
         }
     }
 
