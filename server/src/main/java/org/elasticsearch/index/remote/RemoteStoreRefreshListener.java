@@ -7,6 +7,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.elasticsearch.index.remote.observability.RemoteStoreTracer;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.store.Store;
 
@@ -31,6 +32,7 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
     private final Set<String> uploadedFiles = new HashSet<>();
     private final AtomicLong lastUploadedGeneration = new AtomicLong(-1);
     private final AtomicBoolean active = new AtomicBoolean(false);
+    private volatile RemoteStoreTracer tracer;
 
     public RemoteStoreRefreshListener(ShardId shardId, Store store, Directory localDirectory,
                                       RemoteSegmentStoreDirectory remoteDirectory,
@@ -42,12 +44,14 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
         this.scheduler = scheduler;
         this.primaryTerm = primaryTerm;
         this.active.set(true);
+        this.tracer = new RemoteStoreTracer(true, 0.1);
     }
 
     public RemoteStoreRefreshListener(ShardId shardId, Store store, Directory localDirectory) {
         this.shardId = shardId;
         this.store = store;
         this.localDirectory = localDirectory;
+        this.tracer = new RemoteStoreTracer(false, 0.0);
     }
 
     public void activate(RemoteSegmentStoreDirectory remoteDirectory, SegmentUploadScheduler scheduler, long primaryTerm) {
@@ -91,10 +95,13 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
         for (String fileName : toUpload) {
             byte[] content = readLocalFile(fileName);
             if (content != null) {
+                RemoteStoreTracer.SpanHandle span = tracer.startSpan("segment_upload", shardId + "/" + fileName);
+                span.addAttribute("file_size", content.length);
                 SegmentUploadScheduler.UploadTask task = new SegmentUploadScheduler.UploadTask(
                     fileName, content, SegmentUploadScheduler.Priority.NORMAL
                 );
                 scheduler.schedule(task).whenComplete((v, ex) -> {
+                    span.end(ex == null);
                     if (ex == null) {
                         synchronized (uploadedFiles) {
                             uploadedFiles.add(fileName);

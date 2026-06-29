@@ -3,6 +3,7 @@ package org.elasticsearch.index.remote.cache;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.blobstore.BlobContainer;
+import org.elasticsearch.index.remote.observability.RemoteStoreTracer;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -23,12 +24,14 @@ public class SharedBlobCacheService {
     private final LFUDecayPolicy evictionPolicy;
     private final Map<String, CacheRegion> regionMap = new ConcurrentHashMap<>();
     private final Map<String, RegionSparseFileTracker> trackers = new ConcurrentHashMap<>();
+    private final RemoteStoreTracer tracer;
 
-    public SharedBlobCacheService(long totalSize, int regionSize, LFUDecayPolicy evictionPolicy) {
+    public SharedBlobCacheService(long totalSize, int regionSize, LFUDecayPolicy evictionPolicy, RemoteStoreTracer tracer) {
         this.totalSize = totalSize;
         this.regionSize = regionSize;
         this.maxRegions = (int) (totalSize / regionSize);
         this.evictionPolicy = evictionPolicy;
+        this.tracer = tracer;
     }
 
     public ByteBuffer read(String cacheKey, long position, int length,
@@ -56,11 +59,17 @@ public class SharedBlobCacheService {
             regionMap.put(regionKey, region);
         }
 
+        RemoteStoreTracer.SpanHandle span = tracer.startSpan("cache_miss_fetch", regionKey);
         try (InputStream is = remote.readBlob(blobName, regionOffset, regionSize)) {
             byte[] data = readFully(is);
             region.getBuffer().clear();
             region.getBuffer().put(data, 0, Math.min(data.length, regionSize));
             tracker.markComplete(0, Math.min(data.length, regionSize));
+            span.addAttribute("bytes_fetched", (long) data.length);
+            span.end(true);
+        } catch (IOException e) {
+            span.end(false);
+            throw e;
         }
 
         region.recordAccess();
