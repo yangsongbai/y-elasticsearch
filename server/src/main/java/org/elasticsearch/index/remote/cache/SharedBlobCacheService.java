@@ -43,20 +43,19 @@ public class SharedBlobCacheService {
         long regionOffset = (position / regionSize) * (long) regionSize;
         long offsetInRegion = position - regionOffset;
 
-        CacheRegion region = regionMap.get(regionKey);
-        if (region != null && tracker.isRangeAvailable(offsetInRegion, offsetInRegion + length)) {
+        CacheRegion region = regionMap.computeIfAbsent(regionKey, k -> {
+            ensureCapacity();
+            CacheRegion newRegion = new CacheRegion(regionMap.size(), regionSize);
+            newRegion.allocate();
+            return newRegion;
+        });
+
+        if (tracker.isRangeAvailable(offsetInRegion, offsetInRegion + length)) {
             region.recordAccess();
             ByteBuffer buf = region.getBuffer().duplicate();
             buf.position((int) offsetInRegion);
             buf.limit((int) (offsetInRegion + length));
             return buf.slice();
-        }
-
-        if (region == null) {
-            ensureCapacity();
-            region = new CacheRegion(regionMap.size(), regionSize);
-            region.allocate();
-            regionMap.put(regionKey, region);
         }
 
         RemoteStoreTracer.SpanHandle span = tracer.startSpan("cache_miss_fetch", regionKey);

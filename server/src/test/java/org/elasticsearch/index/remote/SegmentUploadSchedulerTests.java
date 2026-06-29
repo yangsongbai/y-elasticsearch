@@ -55,8 +55,8 @@ public class SegmentUploadSchedulerTests extends ESTestCase {
         );
         CompletableFuture<Void> future = scheduler.schedule(task);
 
-        assertTrue(scheduler.getBytesPending() > 0 || future.isDone());
-        future.get(10, TimeUnit.SECONDS);
+        assertTrue(future.isCompletedExceptionally());
+        expectThrows(java.util.concurrent.ExecutionException.class, () -> future.get(1, TimeUnit.SECONDS));
     }
 
     public void testPriorityOrdering() throws Exception {

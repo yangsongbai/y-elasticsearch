@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 public class PITRService {
@@ -14,7 +15,7 @@ public class PITRService {
     private final Map<String, List<PITRMetadata>> recoveryPoints = new ConcurrentHashMap<>();
 
     public void registerRecoveryPoint(PITRMetadata point) {
-        recoveryPoints.computeIfAbsent(point.indexName(), k -> new ArrayList<>()).add(point);
+        recoveryPoints.computeIfAbsent(point.indexName(), k -> new CopyOnWriteArrayList<>()).add(point);
     }
 
     public PITRMetadata findClosestRecoveryPoint(String indexName, long targetTimestamp) {
@@ -38,13 +39,14 @@ public class PITRService {
         if (points == null) return;
 
         long cutoff = System.currentTimeMillis() - retentionMs;
+        List<PITRMetadata> snapshot = new ArrayList<>(points);
 
-        List<PITRMetadata> kept = points.stream()
+        List<PITRMetadata> kept = snapshot.stream()
             .filter(p -> p.timestamp() >= cutoff)
             .collect(Collectors.toList());
 
         Map<Long, PITRMetadata> hourlyBeyond = new HashMap<>();
-        for (PITRMetadata p : points) {
+        for (PITRMetadata p : snapshot) {
             if (p.timestamp() < cutoff) {
                 long hourKey = p.timestamp() / 3600_000L;
                 PITRMetadata existing = hourlyBeyond.get(hourKey);
@@ -56,6 +58,6 @@ public class PITRService {
         kept.addAll(hourlyBeyond.values());
         kept.sort(Comparator.comparingLong(PITRMetadata::timestamp).reversed());
 
-        recoveryPoints.put(indexName, kept);
+        recoveryPoints.put(indexName, new CopyOnWriteArrayList<>(kept));
     }
 }

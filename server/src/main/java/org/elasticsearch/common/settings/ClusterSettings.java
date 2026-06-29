@@ -80,6 +80,8 @@ import org.elasticsearch.index.IndexingPressure;
 import org.elasticsearch.index.remote.RemoteStoreSettings;
 import org.elasticsearch.index.remote.cache.FileCacheSettings;
 import org.elasticsearch.index.remote.autoscaling.AutoscalingSettings;
+import org.elasticsearch.index.remote.observability.TracingSettings;
+import org.elasticsearch.index.remote.prefetch.PrefetchSettings;
 import org.elasticsearch.index.remote.tiering.TieringPolicySettings;
 import org.elasticsearch.indices.IndexingMemoryController;
 import org.elasticsearch.indices.IndicesQueryCache;
@@ -371,6 +373,13 @@ public final class ClusterSettings extends AbstractScopedSettings {
                 AutoscalingSettings.WARM_MAX,
                 AutoscalingSettings.HOT_MIN,
                 AutoscalingSettings.HOT_MAX,
+                PrefetchSettings.ENABLED,
+                PrefetchSettings.RATE_LIMIT,
+                PrefetchSettings.CONCURRENCY,
+                PrefetchSettings.CACHE_THRESHOLD,
+                TracingSettings.TRACING_ENABLED,
+                TracingSettings.SAMPLER_FRACTION,
+                TracingSettings.EXPORTER_TYPE,
                 ClusterApplierService.CLUSTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,
                 ClusterService.USER_DEFINED_METADATA,
                 MasterService.MASTER_SERVICE_SLOW_TASK_LOGGING_THRESHOLD_SETTING,

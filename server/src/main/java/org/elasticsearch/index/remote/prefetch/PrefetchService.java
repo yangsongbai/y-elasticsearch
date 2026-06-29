@@ -58,7 +58,10 @@ public class PrefetchService {
 
         threadPool.generic().execute(() -> {
             try {
-                concurrency.acquire();
+                if (!concurrency.tryAcquire()) {
+                    logger.debug("Prefetch skipped for [{}]: concurrency limit reached", target);
+                    return;
+                }
                 try {
                     fetchAction.accept(target);
                 } finally {

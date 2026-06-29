@@ -78,7 +78,14 @@ public class SegmentUploadScheduler implements Closeable {
             task.completionFuture.completeExceptionally(new IllegalStateException("scheduler closed"));
             return task.completionFuture;
         }
-        bytesPending.addAndGet(task.content.length);
+        long pending = bytesPending.addAndGet(task.content.length);
+        if (pending > maxBytesInFlight) {
+            bytesPending.addAndGet(-task.content.length);
+            task.completionFuture.completeExceptionally(
+                new IllegalStateException("backpressure: bytes pending [" + (pending - task.content.length)
+                    + "] exceeds max [" + maxBytesInFlight + "]"));
+            return task.completionFuture;
+        }
         queue.offer(task);
         drainQueue();
         return task.completionFuture;

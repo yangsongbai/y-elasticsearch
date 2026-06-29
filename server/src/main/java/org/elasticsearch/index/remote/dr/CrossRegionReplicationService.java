@@ -12,30 +12,21 @@ public class CrossRegionReplicationService {
     }
 
     public void stopReplication(String indexName) {
-        ReplicationState current = states.get(indexName);
-        if (current != null) {
-            states.put(indexName, new ReplicationState(
-                current.sourceRegion(), current.targetRegion(),
-                current.sourceCheckpoint(), current.targetCheckpoint(), false));
-        }
+        states.computeIfPresent(indexName, (k, current) -> new ReplicationState(
+            current.sourceRegion(), current.targetRegion(),
+            current.sourceCheckpoint(), current.targetCheckpoint(), false));
     }
 
     public void updateSourceCheckpoint(String indexName, long checkpoint) {
-        ReplicationState current = states.get(indexName);
-        if (current != null) {
-            states.put(indexName, new ReplicationState(
-                current.sourceRegion(), current.targetRegion(),
-                checkpoint, current.targetCheckpoint(), current.isActive()));
-        }
+        states.computeIfPresent(indexName, (k, current) -> new ReplicationState(
+            current.sourceRegion(), current.targetRegion(),
+            checkpoint, current.targetCheckpoint(), current.isActive()));
     }
 
     public void updateTargetCheckpoint(String indexName, long checkpoint) {
-        ReplicationState current = states.get(indexName);
-        if (current != null) {
-            states.put(indexName, new ReplicationState(
-                current.sourceRegion(), current.targetRegion(),
-                current.sourceCheckpoint(), checkpoint, current.isActive()));
-        }
+        states.computeIfPresent(indexName, (k, current) -> new ReplicationState(
+            current.sourceRegion(), current.targetRegion(),
+            current.sourceCheckpoint(), checkpoint, current.isActive()));
     }
 
     public ReplicationState getReplicationState(String indexName) {

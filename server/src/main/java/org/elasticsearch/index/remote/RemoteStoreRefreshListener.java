@@ -12,10 +12,14 @@ import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.store.Store;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -29,7 +33,7 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
     private volatile RemoteSegmentStoreDirectory remoteDirectory;
     private volatile SegmentUploadScheduler scheduler;
     private volatile long primaryTerm;
-    private final Set<String> uploadedFiles = new HashSet<>();
+    private final Set<String> uploadedFiles = ConcurrentHashMap.newKeySet();
     private final AtomicLong lastUploadedGeneration = new AtomicLong(-1);
     private final AtomicBoolean active = new AtomicBoolean(false);
     private volatile RemoteStoreTracer tracer;
@@ -92,6 +96,7 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
             return;
         }
 
+        List<CompletableFuture<Void>> uploadFutures = new ArrayList<>();
         for (String fileName : toUpload) {
             byte[] content = readLocalFile(fileName);
             if (content != null) {
@@ -100,16 +105,17 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
                 SegmentUploadScheduler.UploadTask task = new SegmentUploadScheduler.UploadTask(
                     fileName, content, SegmentUploadScheduler.Priority.NORMAL
                 );
-                scheduler.schedule(task).whenComplete((v, ex) -> {
+                CompletableFuture<Void> future = scheduler.schedule(task).whenComplete((v, ex) -> {
                     span.end(ex == null);
                     if (ex == null) {
-                        synchronized (uploadedFiles) {
-                            uploadedFiles.add(fileName);
-                        }
+                        uploadedFiles.add(fileName);
                     }
                 });
+                uploadFutures.add(future);
             }
         }
+
+        CompletableFuture.allOf(uploadFutures.toArray(new CompletableFuture<?>[0])).join();
 
         long generation = segmentInfos.getGeneration();
         Map<String, RemoteSegmentMetadata.FileInfo> fileInfos = new HashMap<>();
