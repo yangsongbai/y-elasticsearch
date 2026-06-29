@@ -1,0 +1,16 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: PodChaos
+metadata:
+  name: es-pod-random-kill
+  namespace: elasticsearch
+spec:
+  action: pod-kill
+  mode: one
+  selector:
+    namespaces:
+      - elasticsearch
+    labelSelectors:
+      app: elasticsearch
+  scheduler:
+    cron: "0 */4 * * *"
+  duration: "30s"

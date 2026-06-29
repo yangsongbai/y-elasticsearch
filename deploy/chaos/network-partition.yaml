@@ -1,0 +1,22 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: es-az-partition
+  namespace: elasticsearch
+spec:
+  action: partition
+  mode: all
+  selector:
+    namespaces:
+      - elasticsearch
+    labelSelectors:
+      topology.kubernetes.io/zone: az-1
+  direction: both
+  target:
+    selector:
+      namespaces:
+        - elasticsearch
+      labelSelectors:
+        topology.kubernetes.io/zone: az-2
+    mode: all
+  duration: "60s"

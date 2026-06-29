@@ -1,0 +1,23 @@
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: es-s3-latency
+  namespace: elasticsearch
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - elasticsearch
+    labelSelectors:
+      app: elasticsearch
+      role: data_hot
+  delay:
+    latency: "5000ms"
+    correlation: "80"
+    jitter: "2000ms"
+  direction: to
+  externalTargets:
+    - "s3.amazonaws.com"
+    - "*.s3.amazonaws.com"
+  duration: "300s"
