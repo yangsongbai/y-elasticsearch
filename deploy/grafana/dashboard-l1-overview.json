@@ -1,0 +1,46 @@
+{
+  "dashboard": {
+    "title": "ES Remote Store - L1 Overview",
+    "tags": ["elasticsearch", "remote-store"],
+    "panels": [
+      {
+        "title": "Write Throughput",
+        "type": "graph",
+        "targets": [{"expr": "rate(es_indexing_total[5m])"}],
+        "gridPos": {"x": 0, "y": 0, "w": 8, "h": 6}
+      },
+      {
+        "title": "Search P99 by Tier",
+        "type": "graph",
+        "targets": [{"expr": "histogram_quantile(0.99, rate(es_search_latency_seconds_bucket[5m]))"}],
+        "gridPos": {"x": 8, "y": 0, "w": 8, "h": 6}
+      },
+      {
+        "title": "Remote Store Upload Lag",
+        "type": "gauge",
+        "targets": [{"expr": "es_remote_store_lag_seconds"}],
+        "gridPos": {"x": 16, "y": 0, "w": 8, "h": 6}
+      },
+      {
+        "title": "FileCache Hit Ratio",
+        "type": "graph",
+        "targets": [{"expr": "es_filecache_hit_ratio"}],
+        "gridPos": {"x": 0, "y": 6, "w": 8, "h": 6}
+      },
+      {
+        "title": "Node Count by Tier",
+        "type": "stat",
+        "targets": [{"expr": "es_autoscaling_current_nodes"}],
+        "gridPos": {"x": 8, "y": 6, "w": 8, "h": 6}
+      },
+      {
+        "title": "Tiering In Progress",
+        "type": "table",
+        "targets": [{"expr": "es_tiering_in_progress"}],
+        "gridPos": {"x": 16, "y": 6, "w": 8, "h": 6}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "30s"
+  }
+}
