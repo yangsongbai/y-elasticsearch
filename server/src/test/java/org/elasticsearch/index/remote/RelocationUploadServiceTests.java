@@ -1,56 +1,79 @@
 package org.elasticsearch.index.remote;
 
 import org.elasticsearch.test.ESTestCase;
+import org.elasticsearch.threadpool.TestThreadPool;
+import org.elasticsearch.threadpool.ThreadPool;
+
+import java.util.concurrent.TimeUnit;
 
 public class RelocationUploadServiceTests extends ESTestCase {
 
-    public void testForceUploadBlocksHandoffUntilComplete() {
-        RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L);
-        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
+    public void testForceUploadBlocksHandoffUntilComplete() throws Exception {
+        ThreadPool threadPool = new TestThreadPool("test");
+        try {
+            RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L, threadPool);
+            RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
 
-        service.setForceUploadCallback(fromSeqNo -> {
-            assertEquals(80L, fromSeqNo);
-            return 100L;
-        });
+            service.setForceUploadCallback(fromSeqNo -> {
+                assertEquals(80L, fromSeqNo);
+                return 100L;
+            });
 
-        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
-        assertEquals(RelocationUploadService.HandoffReadiness.READY, readiness);
+            RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+            assertEquals(RelocationUploadService.HandoffReadiness.READY, readiness);
+        } finally {
+            ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
+        }
     }
 
-    public void testHandoffDelayedWhenTailExceedsMax() {
-        RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L);
-        // Tail is 500MB — exceeds max
-        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(
-            100L, 80L, 500_000_000L);
+    public void testHandoffDelayedWhenTailExceedsMax() throws Exception {
+        ThreadPool threadPool = new TestThreadPool("test");
+        try {
+            RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L, threadPool);
+            RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(
+                100L, 80L, 500_000_000L);
 
-        service.setForceUploadCallback(fromSeqNo -> 90L); // partial upload
+            service.setForceUploadCallback(fromSeqNo -> 90L);
 
-        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
-        assertEquals(RelocationUploadService.HandoffReadiness.DELAYED, readiness);
+            RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+            assertEquals(RelocationUploadService.HandoffReadiness.DELAYED, readiness);
+        } finally {
+            ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
+        }
     }
 
-    public void testHandoffTimesOut() {
-        RelocationUploadService service = new RelocationUploadService(100L, 256 * 1024 * 1024L);
-        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
+    public void testHandoffTimesOut() throws Exception {
+        ThreadPool threadPool = new TestThreadPool("test");
+        try {
+            RelocationUploadService service = new RelocationUploadService(100L, 256 * 1024 * 1024L, threadPool);
+            RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
 
-        service.setForceUploadCallback(fromSeqNo -> {
-            try {
-                Thread.sleep(300);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            return 100L;
-        });
+            service.setForceUploadCallback(fromSeqNo -> {
+                try {
+                    Thread.sleep(300);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                return 100L;
+            });
 
-        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
-        assertEquals(RelocationUploadService.HandoffReadiness.TIMEOUT, readiness);
+            RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+            assertEquals(RelocationUploadService.HandoffReadiness.TIMEOUT, readiness);
+        } finally {
+            ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
+        }
     }
 
-    public void testHandoffReadyWithNoCallback() {
-        RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L);
-        RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
+    public void testHandoffReadyWithNoCallback() throws Exception {
+        ThreadPool threadPool = new TestThreadPool("test");
+        try {
+            RelocationUploadService service = new RelocationUploadService(60_000L, 256 * 1024 * 1024L, threadPool);
+            RelocationUploadService.TailState tailState = new RelocationUploadService.TailState(100L, 80L, 50_000_000L);
 
-        RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
-        assertEquals(RelocationUploadService.HandoffReadiness.READY, readiness);
+            RelocationUploadService.HandoffReadiness readiness = service.prepareForHandoff(tailState);
+            assertEquals(RelocationUploadService.HandoffReadiness.READY, readiness);
+        } finally {
+            ThreadPool.terminate(threadPool, 30, TimeUnit.SECONDS);
+        }
     }
 }

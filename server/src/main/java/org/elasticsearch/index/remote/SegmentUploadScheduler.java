@@ -2,6 +2,7 @@ package org.elasticsearch.index.remote;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.Closeable;
@@ -64,18 +65,36 @@ public class SegmentUploadScheduler implements Closeable {
     private final AtomicLong bytesPending = new AtomicLong(0);
     private final PriorityBlockingQueue<UploadTask> queue = new PriorityBlockingQueue<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private volatile BackpressureController backpressureController;
 
     public SegmentUploadScheduler(RemoteSegmentStoreDirectory remoteDirectory, ThreadPool threadPool,
                                   int parallelism, long maxBytesInFlight) {
+        this(remoteDirectory, threadPool, parallelism, maxBytesInFlight, null);
+    }
+
+    public SegmentUploadScheduler(RemoteSegmentStoreDirectory remoteDirectory, ThreadPool threadPool,
+                                  int parallelism, long maxBytesInFlight,
+                                  BackpressureController backpressureController) {
         this.remoteDirectory = remoteDirectory;
         this.threadPool = threadPool;
         this.parallelismSemaphore = new Semaphore(parallelism);
         this.maxBytesInFlight = maxBytesInFlight;
+        this.backpressureController = backpressureController;
+    }
+
+    public void setBackpressureController(BackpressureController controller) {
+        this.backpressureController = controller;
     }
 
     public CompletableFuture<Void> schedule(UploadTask task) {
         if (closed.get()) {
             task.completionFuture.completeExceptionally(new IllegalStateException("scheduler closed"));
+            return task.completionFuture;
+        }
+        BackpressureController bp = this.backpressureController;
+        if (bp != null && !bp.allowWrite()) {
+            task.completionFuture.completeExceptionally(
+                new IllegalStateException("backpressure: writes blocked at level [" + bp.getLevel() + "]"));
             return task.completionFuture;
         }
         long pending = bytesPending.addAndGet(task.content.length);
@@ -98,7 +117,28 @@ public class SegmentUploadScheduler implements Closeable {
                 parallelismSemaphore.release();
                 break;
             }
-            threadPool.generic().execute(() -> executeUpload(task));
+            final UploadTask capturedTask = task;
+            threadPool.generic().execute(threadPool.getThreadContext().preserveContext(new AbstractRunnable() {
+                @Override
+                public void onFailure(Exception e) {
+                    logger.warn("Failed to upload segment file [{}]", capturedTask.fileName, e);
+                    capturedTask.completionFuture.completeExceptionally(e);
+                    bytesPending.addAndGet(-capturedTask.content.length);
+                    parallelismSemaphore.release();
+                }
+
+                @Override
+                protected void doRun() {
+                    executeUpload(capturedTask);
+                }
+
+                @Override
+                public void onRejection(Exception e) {
+                    capturedTask.completionFuture.completeExceptionally(e);
+                    bytesPending.addAndGet(-capturedTask.content.length);
+                    parallelismSemaphore.release();
+                }
+            }));
         }
     }
 
@@ -106,13 +146,29 @@ public class SegmentUploadScheduler implements Closeable {
         try {
             remoteDirectory.uploadSegmentFile(task.fileName, task.content);
             task.completionFuture.complete(null);
+            BackpressureController bp = this.backpressureController;
+            if (bp != null) {
+                bp.recordSuccess();
+            }
         } catch (Exception e) {
             logger.warn("Failed to upload segment file [{}]", task.fileName, e);
             task.completionFuture.completeExceptionally(e);
+            BackpressureController bp = this.backpressureController;
+            if (bp != null) {
+                try {
+                    bp.recordFailure();
+                } catch (Exception suppressed) {
+                    e.addSuppressed(suppressed);
+                }
+            }
         } finally {
             bytesPending.addAndGet(-task.content.length);
             parallelismSemaphore.release();
-            drainQueue();
+            try {
+                drainQueue();
+            } catch (Exception e) {
+                logger.warn("Failed to drain upload queue", e);
+            }
         }
     }
 
@@ -127,5 +183,10 @@ public class SegmentUploadScheduler implements Closeable {
     @Override
     public void close() {
         closed.set(true);
+        UploadTask task;
+        while ((task = queue.poll()) != null) {
+            task.completionFuture.completeExceptionally(new IllegalStateException("scheduler closed"));
+            bytesPending.addAndGet(-task.content.length);
+        }
     }
 }

@@ -2,12 +2,13 @@ package org.elasticsearch.index.remote;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.elasticsearch.common.util.concurrent.AbstractRunnable;
+import org.elasticsearch.threadpool.ThreadPool;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongUnaryOperator;
 
 public class RelocationUploadService {
@@ -16,11 +17,13 @@ public class RelocationUploadService {
 
     private final long handoffTimeoutMs;
     private final long maxTailAtHandoff;
-    private LongUnaryOperator forceUploadCallback;
+    private final ThreadPool threadPool;
+    private volatile LongUnaryOperator forceUploadCallback;
 
-    public RelocationUploadService(long handoffTimeoutMs, long maxTailAtHandoff) {
+    public RelocationUploadService(long handoffTimeoutMs, long maxTailAtHandoff, ThreadPool threadPool) {
         this.handoffTimeoutMs = handoffTimeoutMs;
         this.maxTailAtHandoff = maxTailAtHandoff;
+        this.threadPool = threadPool;
     }
 
     public void setForceUploadCallback(LongUnaryOperator callback) {
@@ -28,7 +31,8 @@ public class RelocationUploadService {
     }
 
     public HandoffReadiness prepareForHandoff(TailState tailState) {
-        if (forceUploadCallback == null) {
+        LongUnaryOperator callback = this.forceUploadCallback;
+        if (callback == null) {
             logger.warn("No force upload callback registered, handoff without upload");
             return HandoffReadiness.READY;
         }
@@ -36,10 +40,35 @@ public class RelocationUploadService {
         logger.info("Preparing for handoff: LUS={}, localCP={}, tailBytes={}",
             tailState.lastUploadedSeqNo, tailState.localCheckpoint, tailState.tailSizeBytes);
 
-        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        AtomicReference<Thread> runningThread = new AtomicReference<>();
+        threadPool.generic().execute(threadPool.getThreadContext().preserveContext(new AbstractRunnable() {
+            @Override
+            public void onFailure(Exception e) {
+                future.completeExceptionally(e);
+            }
+
+            @Override
+            protected void doRun() {
+                runningThread.set(Thread.currentThread());
+                try {
+                    if (future.isCancelled()) {
+                        return;
+                    }
+                    long result = callback.applyAsLong(tailState.lastUploadedSeqNo);
+                    future.complete(result);
+                } finally {
+                    runningThread.set(null);
+                }
+            }
+
+            @Override
+            public void onRejection(Exception e) {
+                future.completeExceptionally(e);
+            }
+        }));
+
         try {
-            Future<Long> future = executor.submit(
-                () -> forceUploadCallback.applyAsLong(tailState.lastUploadedSeqNo));
             long newLUS = future.get(handoffTimeoutMs, TimeUnit.MILLISECONDS);
 
             long remainingSeqNoGap = tailState.localCheckpoint - newLUS;
@@ -51,13 +80,24 @@ public class RelocationUploadService {
             logger.info("Force upload complete: newLUS={}, ready for handoff", newLUS);
             return HandoffReadiness.READY;
         } catch (TimeoutException e) {
+            future.cancel(true);
+            Thread t = runningThread.getAndSet(null);
+            if (t != null) {
+                t.interrupt();
+            }
             logger.error("Force upload timed out after {}ms", handoffTimeoutMs);
             return HandoffReadiness.TIMEOUT;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            future.cancel(true);
+            Thread t = runningThread.getAndSet(null);
+            if (t != null) {
+                t.interrupt();
+            }
+            return HandoffReadiness.FAILED;
         } catch (Exception e) {
             logger.error("Force upload failed", e);
             return HandoffReadiness.FAILED;
-        } finally {
-            executor.shutdownNow();
         }
     }
 

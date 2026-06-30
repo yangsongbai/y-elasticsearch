@@ -4,6 +4,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.common.blobstore.BlobContainer;
 import org.elasticsearch.common.bytes.BytesReference;
+import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xcontent.XContentFactory;
@@ -14,6 +15,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -40,11 +42,11 @@ public class RemoteTranslogTransferManager implements Closeable {
     public void uploadGeneration(Path translogFile, long generation, long primaryTerm,
                                  long minSeqNo, long maxSeqNo) throws IOException {
         String fileName = translogFile.getFileName().toString();
+        long size = Files.size(translogFile);
         try (InputStream is = Files.newInputStream(translogFile)) {
-            long size = Files.size(translogFile);
             translogBlobContainer.writeBlob(fileName, is, size, true);
         }
-        lastUploadedGeneration.set(generation);
+        updateLastUploadedGeneration(generation);
     }
 
     public void uploadGenerationAsync(Path translogFile, long generation, long primaryTerm,
@@ -52,18 +54,40 @@ public class RemoteTranslogTransferManager implements Closeable {
         if (closed.get()) {
             return;
         }
-        threadPool.generic().execute(() -> {
-            try {
-                parallelism.acquire();
+        threadPool.generic().execute(threadPool.getThreadContext().preserveContext(new AbstractRunnable() {
+            @Override
+            public void onFailure(Exception e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                    logger.warn("Interrupted while uploading translog generation [{}]", generation);
+                } else {
+                    logger.warn("Failed to upload translog generation [{}]", generation, e);
+                }
+            }
+
+            @Override
+            protected void doRun() throws Exception {
+                if (closed.get()) {
+                    return;
+                }
+                if (!parallelism.tryAcquire(30, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting for upload permit for translog generation [" + generation + "]");
+                }
                 try {
+                    if (closed.get()) {
+                        return;
+                    }
                     uploadGeneration(translogFile, generation, primaryTerm, minSeqNo, maxSeqNo);
                 } finally {
                     parallelism.release();
                 }
-            } catch (Exception e) {
-                logger.warn("Failed to upload translog generation [{}]", generation, e);
             }
-        });
+
+            @Override
+            public void onRejection(Exception e) {
+                logger.debug("Translog upload rejected for generation [{}] during shutdown", generation);
+            }
+        }));
     }
 
     public void uploadTranslogMetadata(long primaryTerm, long generation,
@@ -87,6 +111,16 @@ public class RemoteTranslogTransferManager implements Closeable {
 
     public long getLastUploadedGeneration() {
         return lastUploadedGeneration.get();
+    }
+
+    private void updateLastUploadedGeneration(long generation) {
+        long current;
+        do {
+            current = lastUploadedGeneration.get();
+            if (generation <= current) {
+                return;
+            }
+        } while (!lastUploadedGeneration.compareAndSet(current, generation));
     }
 
     @Override

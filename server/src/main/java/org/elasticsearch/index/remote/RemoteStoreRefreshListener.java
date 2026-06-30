@@ -7,6 +7,7 @@ import org.apache.lucene.search.ReferenceManager;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
+import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.index.remote.observability.RemoteStoreTracer;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.store.Store;
@@ -41,6 +42,8 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
     private final Set<String> uploadedFiles = ConcurrentHashMap.newKeySet();
     private final AtomicLong lastUploadedGeneration = new AtomicLong(-1);
     private final AtomicBoolean active = new AtomicBoolean(false);
+    private final AtomicBoolean uploadInProgress = new AtomicBoolean(false);
+    private final AtomicBoolean pendingUpload = new AtomicBoolean(false);
     private volatile RemoteStoreTracer tracer;
     private volatile ThreadPool threadPool;
 
@@ -84,16 +87,49 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
         if (!didRefresh || !active.get()) {
             return;
         }
+        if (!uploadInProgress.compareAndSet(false, true)) {
+            pendingUpload.set(true);
+            logger.debug("[{}] Skipping upload, previous upload still in progress", shardId);
+            return;
+        }
         ThreadPool tp = this.threadPool;
         if (tp != null) {
-            tp.generic().execute(() -> {
-                try {
-                    uploadNewSegments();
-                } catch (Exception e) {
+            tp.generic().execute(tp.getThreadContext().preserveContext(new AbstractRunnable() {
+                @Override
+                public void onFailure(Exception e) {
+                    uploadInProgress.set(false);
                     logger.warn("[{}] Failed to upload segments after refresh", shardId, e);
+                    pendingUpload.set(true);
                 }
-            });
+
+                @Override
+                protected void doRun() throws Exception {
+                    try {
+                        uploadNewSegments();
+                    } catch (Exception e) {
+                        logger.warn("[{}] Failed to upload segments after refresh", shardId, e);
+                    } finally {
+                        uploadInProgress.set(false);
+                        if (pendingUpload.getAndSet(false) && active.get()) {
+                            afterRefresh(true);
+                        }
+                    }
+                }
+
+                @Override
+                public void onRejection(Exception e) {
+                    uploadInProgress.set(false);
+                    logger.debug("[{}] Upload rejected during shutdown", shardId);
+                    pendingUpload.set(true);
+                }
+            }));
+        } else {
+            uploadInProgress.set(false);
         }
+    }
+
+    public void deactivate() {
+        active.set(false);
     }
 
     public boolean isActive() {
@@ -108,16 +144,15 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
         toUpload.removeAll(uploadedFiles);
 
         if (toUpload.isEmpty()) {
+            pruneUploadedFiles(currentFiles);
             return;
         }
 
         List<CompletableFuture<Void>> uploadFutures = new ArrayList<>();
-        Set<String> attemptedFiles = new HashSet<>();
 
         for (String fileName : toUpload) {
             byte[] content = readLocalFile(fileName);
             if (content != null) {
-                attemptedFiles.add(fileName);
                 RemoteStoreTracer.SpanHandle span = tracer.startSpan("segment_upload", shardId + "/" + fileName);
                 span.addAttribute("file_size", content.length);
                 SegmentUploadScheduler.UploadTask task = new SegmentUploadScheduler.UploadTask(
@@ -180,15 +215,31 @@ public class RemoteStoreRefreshListener implements ReferenceManager.RefreshListe
         }
 
         RemoteSegmentMetadata metadata = new RemoteSegmentMetadata(
-            primaryTerm, generation, segmentInfos.getGeneration(), fileInfos
+            primaryTerm, generation, lastUploadedGeneration.get(), fileInfos
         );
 
         try {
             remoteDirectory.uploadMetadata(metadata);
-            lastUploadedGeneration.set(generation);
+            updateLastUploadedGeneration(generation);
         } catch (IOException e) {
             logger.warn("[{}] Failed to upload segment metadata", shardId, e);
         }
+
+        pruneUploadedFiles(currentFiles);
+    }
+
+    private void updateLastUploadedGeneration(long generation) {
+        long current;
+        do {
+            current = lastUploadedGeneration.get();
+            if (generation <= current) {
+                return;
+            }
+        } while (!lastUploadedGeneration.compareAndSet(current, generation));
+    }
+
+    private void pruneUploadedFiles(Set<String> currentFiles) {
+        uploadedFiles.retainAll(currentFiles);
     }
 
     private byte[] readLocalFile(String fileName) {

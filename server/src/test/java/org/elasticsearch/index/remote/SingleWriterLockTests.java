@@ -13,7 +13,11 @@ public class SingleWriterLockTests extends ESTestCase {
 
     public void testAcquireFirstTime() throws IOException {
         BlobContainer container = mock(BlobContainer.class);
-        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        // First call: readCurrentTerm → NoSuchFileException (lock doesn't exist)
+        // Second call: verifyLockHolder → returns written lock content
+        when(container.readBlob("lock/ownership.lock"))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":1,\"node_id\":\"node-1\"}".getBytes()));
 
         SingleWriterLock lock = new SingleWriterLock(container);
         boolean acquired = lock.tryAcquire(1L, "node-1");
@@ -25,14 +29,17 @@ public class SingleWriterLockTests extends ESTestCase {
 
     public void testAcquireWithHigherTerm() throws IOException {
         BlobContainer container = mock(BlobContainer.class);
-        String existing = "{\"primary_term\":1,\"node_id\":\"node-1\"}";
+        // First call: readCurrentTerm → returns existing lock with lower term
+        // Second call: verifyLockHolder → returns our written lock
         when(container.readBlob("lock/ownership.lock"))
-            .thenReturn(new ByteArrayInputStream(existing.getBytes()));
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":1,\"node_id\":\"node-1\"}".getBytes()))
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":2,\"node_id\":\"node-2\"}".getBytes()));
 
         SingleWriterLock lock = new SingleWriterLock(container);
         boolean acquired = lock.tryAcquire(2L, "node-2");
 
         assertTrue(acquired);
+        verify(container).writeBlob(eq("lock/ownership.lock"), any(), anyLong(), eq(true));
     }
 
     public void testAcquireFailsWithLowerTerm() throws IOException {
@@ -53,10 +60,14 @@ public class SingleWriterLockTests extends ESTestCase {
         SingleWriterLockConfig config = new SingleWriterLockConfig(30000L, 2, 5000L, true);
         SingleWriterLock lock = new SingleWriterLock(container, config);
 
-        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        // tryAcquire: readCurrentTerm → NoSuchFileException, verifyLockHolder → returns lock
+        when(container.readBlob("lock/ownership.lock"))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":1,\"node_id\":\"node-1\"}".getBytes()))
+            .thenThrow(new NoSuchFileException("not found"));
         assertTrue(lock.tryAcquire(1L, "node-1"));
 
-        // Simulate renewal failure
+        // Simulate renewal failure: write fails
         doThrow(new IOException("connection refused"))
             .when(container).writeBlob(anyString(), any(), anyLong(), anyBoolean());
 
@@ -70,9 +81,15 @@ public class SingleWriterLockTests extends ESTestCase {
         SingleWriterLockConfig config = new SingleWriterLockConfig(30000L, 2, 5000L, true);
         SingleWriterLock lock = new SingleWriterLock(container, config);
 
-        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        // tryAcquire: readCurrentTerm → NoSuchFileException, verifyLockHolder → returns lock
+        when(container.readBlob("lock/ownership.lock"))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":1,\"node_id\":\"node-1\"}".getBytes()))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenThrow(new NoSuchFileException("not found"));
         lock.tryAcquire(1L, "node-1");
 
+        // Write fails
         doThrow(new IOException("timeout"))
             .when(container).writeBlob(anyString(), any(), anyLong(), anyBoolean());
 
@@ -89,10 +106,15 @@ public class SingleWriterLockTests extends ESTestCase {
         SingleWriterLockConfig config = new SingleWriterLockConfig(30000L, 2, 5000L, true);
         SingleWriterLock lock = new SingleWriterLock(container, config);
 
-        when(container.readBlob("lock/ownership.lock")).thenThrow(new NoSuchFileException("not found"));
+        // tryAcquire: readCurrentTerm → NoSuchFileException, verifyLockHolder → returns lock
+        when(container.readBlob("lock/ownership.lock"))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenReturn(new ByteArrayInputStream("{\"primary_term\":1,\"node_id\":\"node-1\"}".getBytes()))
+            .thenThrow(new NoSuchFileException("not found"))
+            .thenThrow(new NoSuchFileException("not found"));
         lock.tryAcquire(1L, "node-1");
 
-        // Enter degraded mode
+        // Enter degraded mode: write fails
         doThrow(new IOException("timeout"))
             .when(container).writeBlob(anyString(), any(), anyLong(), anyBoolean());
         lock.tryRenew(1L, "node-1");
@@ -101,6 +123,8 @@ public class SingleWriterLockTests extends ESTestCase {
 
         // Remote recovers
         reset(container);
+        when(container.readBlob("lock/ownership.lock"))
+            .thenThrow(new NoSuchFileException("not found"));
 
         SingleWriterLock.RenewResult result = lock.tryRenew(1L, "node-1");
         assertEquals(SingleWriterLock.RenewResult.SUCCESS, result);
